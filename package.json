@@ -1,0 +1,54 @@
+{
+  "name": "zig-bsdiff",
+  "version": "0.1.0",
+  "description": "Fast binary diff/patch implementation in Zig with zstd compression",
+  "license": "MIT",
+  "author": "Blackboard Technologies Inc.",
+  "keywords": [
+    "bsdiff",
+    "bspatch",
+    "binary",
+    "diff",
+    "patch",
+    "zstd",
+    "zig"
+  ],
+  "type": "module",
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js"
+  },
+  "files": [
+    "index.js",
+    "scripts/postinstall.js",
+    "bin/.gitkeep"
+  ],
+  "homepage": "https://github.com/blackboardsh/zig-bsdiff",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/blackboardsh/zig-bsdiff.git"
+  },
+  "scripts": {
+    "postinstall": "node scripts/postinstall.js",
+    "setup": "node scripts/setup.js",
+    "build": "bun run setup && vendors/zig/zig build",
+    "build:release": "bun run setup && vendors/zig/zig build -Doptimize=ReleaseFast",
+    "zig-test": "vendors/zig/zig build test",
+    "test": "bun test-progress.ts",
+    "dev": "bun run setup && bun run build && bun run zig-test && bun run test",
+    "push:beta": "bun version prerelease --preid=beta && git push origin main --tags",
+    "push:patch": "bun version prepatch --preid=beta && git push origin main --tags",
+    "push:minor": "bun version preminor --preid=beta && git push origin main --tags",
+    "push:major": "bun version premajor --preid=beta && git push origin main --tags",
+    "push:stable": "bun version patch && git push origin main --tags"
+  },
+  "os": [
+    "darwin",
+    "linux",
+    "win32"
+  ],
+  "cpu": [
+    "x64",
+    "arm64"
+  ]
+}

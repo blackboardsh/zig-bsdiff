@@ -1,0 +1,139 @@
+name: Build and Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to release (e.g., v0.1.0 or v0.1.0-beta.1)'
+        required: true
+      prerelease:
+        description: 'Is this a pre-release?'
+        type: boolean
+        default: false
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - os: macos-14
+            platform: darwin
+            arch: arm64
+          - os: macos-15-intel
+            platform: darwin
+            arch: x64
+          - os: ubuntu-24.04
+            platform: linux
+            arch: x64
+          - os: ubuntu-24.04-arm
+            platform: linux
+            arch: arm64
+          - os: windows-2025
+            platform: win32
+            arch: x64
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: goto-bus-stop/setup-zig@v2
+        with:
+          version: 0.13.0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+
+      - name: Setup MSVC Developer Command Prompt
+        if: matrix.platform == 'win32'
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Build binaries
+        run: |
+          zig build -Doptimize=ReleaseFast
+
+      - name: Test
+        run: |
+          zig build test
+
+      - name: Package binaries
+        run: |
+          node scripts/package-binaries.js
+
+      - name: Create tarball
+        shell: bash
+        run: |
+          cd dist
+          if [ "${{ matrix.platform }}" = "win32" ]; then
+            tar -czf ../zig-bsdiff-${{ matrix.platform }}-${{ matrix.arch }}.tar.gz bsdiff.exe bspatch.exe
+          else
+            tar -czf ../zig-bsdiff-${{ matrix.platform }}-${{ matrix.arch }}.tar.gz bsdiff bspatch
+          fi
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: zig-bsdiff-${{ matrix.platform }}-${{ matrix.arch }}
+          path: zig-bsdiff-${{ matrix.platform }}-${{ matrix.arch }}.tar.gz
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: ${{ github.event.inputs.tag || github.ref_name }}
+          files: |
+            artifacts/**/*.tar.gz
+          generate_release_notes: true
+          prerelease: ${{ github.event.inputs.prerelease || contains(github.ref_name, '-beta') || contains(github.event.inputs.tag, '-beta') }}
+          body: |
+            zig-bsdiff release
+
+            Pre-built binaries for:
+            - **macOS** (arm64 & x64): `zig-bsdiff-darwin-[arch].tar.gz`
+            - **Linux** (x64 & arm64): `zig-bsdiff-linux-[arch].tar.gz`
+            - **Windows** (x64): `zig-bsdiff-win32-x64.tar.gz`
+
+  npm-publish:
+    needs: release
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: Publish to npm
+        run: |
+          if [[ "${{ github.event.inputs.tag || github.ref_name }}" == *"beta"* ]]; then
+            echo "Publishing beta release to npm..."
+            npm publish --tag beta
+          else
+            echo "Publishing stable release to npm..."
+            npm publish
+          fi
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

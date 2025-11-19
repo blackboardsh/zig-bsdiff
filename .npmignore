@@ -1,0 +1,29 @@
+# Source files (not needed in npm package - binaries downloaded from GitHub)
+*.zig
+build.zig
+zstd/
+
+# Build artifacts
+zig-cache/
+.zig-cache/
+zig-out/
+dist/
+vendors/
+
+# Test files
+test-progress.ts
+tests.zig
+
+# Development files
+.git/
+.github/
+scripts/setup.js
+scripts/package-binaries.js
+
+# Binaries are downloaded via postinstall, not bundled
+bin/*
+!bin/.gitkeep
+
+# Keep only what's needed for npm
+!index.js
+!scripts/postinstall.js
