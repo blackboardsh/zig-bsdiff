@@ -36,11 +36,11 @@
     "zig-test": "vendors/zig/zig build test",
     "test": "bun test-progress.ts",
     "dev": "bun run setup && bun run build && bun run zig-test && bun run test",
-    "push:beta": "bun version prerelease --preid=beta && git push origin main --tags",
-    "push:patch": "bun version prepatch --preid=beta && git push origin main --tags",
-    "push:minor": "bun version preminor --preid=beta && git push origin main --tags",
-    "push:major": "bun version premajor --preid=beta && git push origin main --tags",
-    "push:stable": "bun version patch && git push origin main --tags"
+    "push:beta": "npm version prerelease --preid=beta && git push origin main --tags",
+    "push:patch": "npm version prepatch --preid=beta && git push origin main --tags",
+    "push:minor": "npm version preminor --preid=beta && git push origin main --tags",
+    "push:major": "npm version premajor --preid=beta && git push origin main --tags",
+    "push:stable": "npm version patch && git push origin main --tags"
   },
   "os": [
     "darwin",
