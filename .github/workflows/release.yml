@@ -114,26 +114,11 @@ jobs:
             - **Linux** (x64 & arm64): `zig-bsdiff-linux-[arch].tar.gz`
             - **Windows** (x64): `zig-bsdiff-win32-x64.tar.gz`
 
-  npm-publish:
-    needs: release
-    runs-on: ubuntu-latest
+            ## Usage
 
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-node@v4
-        with:
-          node-version: '18'
-          registry-url: 'https://registry.npmjs.org'
-
-      - name: Publish to npm
-        run: |
-          if [[ "${{ github.event.inputs.tag || github.ref_name }}" == *"beta"* ]]; then
-            echo "Publishing beta release to npm..."
-            npm publish --tag beta
-          else
-            echo "Publishing stable release to npm..."
-            npm publish
-          fi
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+            Download the appropriate tarball for your platform and extract:
+            ```bash
+            tar -xzf zig-bsdiff-darwin-arm64.tar.gz
+            ./bsdiff old_file new_file patch_file --use-zstd
+            ./bspatch old_file new_file patch_file
+            ```
