@@ -15,13 +15,17 @@
   ],
   "type": "module",
   "main": "index.js",
+  "bin": {
+    "bsdiff": "./bin/bsdiff.cjs",
+    "bspatch": "./bin/bspatch.cjs"
+  },
   "exports": {
     ".": "./index.js"
   },
   "files": [
     "index.js",
-    "scripts/postinstall.js",
-    "bin/.gitkeep"
+    "bin/bsdiff.cjs",
+    "bin/bspatch.cjs"
   ],
   "homepage": "https://github.com/blackboardsh/zig-bsdiff",
   "repository": {
@@ -29,7 +33,6 @@
     "url": "git+https://github.com/blackboardsh/zig-bsdiff.git"
   },
   "scripts": {
-    "postinstall": "node scripts/postinstall.js",
     "setup": "node scripts/setup.js",
     "build": "bun run setup && vendors/zig/zig build",
     "build:release": "bun run setup && vendors/zig/zig build -Doptimize=ReleaseFast",

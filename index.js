@@ -46,13 +46,14 @@ export function getBinaryPath(name) {
   }
 
   const binExt = platform === 'win32' ? '.exe' : '';
-  const binaryPath = join(__dirname, 'bin', `${name}${binExt}`);
+  const binaryPath = join(__dirname, '.cache', `${name}${binExt}`);
 
   if (!existsSync(binaryPath)) {
     throw new Error(
       `Binary not found: ${binaryPath}\n` +
-      `This usually means the postinstall script failed to download binaries.\n` +
-      `Try running: npm rebuild zig-bsdiff`
+      `Binaries will be automatically downloaded on first use.\n` +
+      `Run 'bsdiff' or 'bspatch' to trigger the download, or manually download from:\n` +
+      `https://github.com/blackboardsh/zig-bsdiff/releases`
     );
   }
 
