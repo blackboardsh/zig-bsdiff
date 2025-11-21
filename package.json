@@ -1,6 +1,6 @@
 {
   "name": "zig-bsdiff",
-  "version": "0.1.10-beta.0",
+  "version": "0.1.10",
   "description": "Fast binary diff/patch implementation in Zig with zstd compression",
   "license": "MIT",
   "author": "Blackboard Technologies Inc.",
