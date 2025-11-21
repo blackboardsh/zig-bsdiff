@@ -5,6 +5,10 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
+    // Link pre-compiled libsais (compiled with clang during setup)
+    // Note: We don't use Zig's C backend to compile libsais because it has
+    // incompatibilities. Instead, setup.js compiles it with clang.
+
     const libzstd = b.addStaticLibrary(.{
         .name = "zstd",
         .target = target,
@@ -58,14 +62,11 @@ pub fn build(b: *std.Build) void {
     });
 
     bsdiff.linkLibrary(libzstd);
-    
-    // Force static linking on Windows to avoid runtime dependency issues
-    if (target.result.os.tag == .windows) {
-        bsdiff.linkage = .static;
-    }
+    bsdiff.addObjectFile(b.path("vendors/libsais/libsais.a"));
 
-    // This is for the cImport to import the .h file
+    // This is for the cImport to import the .h files
     bsdiff.addIncludePath(b.path("zstd/lib"));
+    bsdiff.addIncludePath(b.path("vendors/libsais"));
 
     b.installArtifact(bsdiff);
 
@@ -77,12 +78,6 @@ pub fn build(b: *std.Build) void {
     });
 
     bspatch.linkLibrary(libzstd);
-    
-    // Force static linking on Windows to avoid runtime dependency issues
-    if (target.result.os.tag == .windows) {
-        bspatch.linkage = .static;
-    }
-
     bspatch.addIncludePath(b.path("zstd/lib"));
 
     b.installArtifact(bspatch);
@@ -94,7 +89,9 @@ pub fn build(b: *std.Build) void {
     });
 
     tests.addIncludePath(b.path("zstd/lib"));
+    tests.addIncludePath(b.path("vendors/libsais"));
     tests.linkLibrary(libzstd);
+    tests.addObjectFile(b.path("vendors/libsais/libsais.a"));
 
     const run_tests = b.addRunArtifact(tests);
     const test_step = b.step("test", "Run bsdiff/bspatch roundtrip tests");

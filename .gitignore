@@ -13,6 +13,10 @@ bin/*
 
 # Vendored dependencies
 vendors/
+!vendors/libsais/
+vendors/libsais/*
+!vendors/libsais/zig_wrapper.c
+!vendors/libsais/zig_wrapper.h
 
 # OS files
 .DS_Store
@@ -21,3 +25,9 @@ Thumbs.db
 # Test files
 *.tar.gz
 *.patch
+*.dSYM/
+test-data/
+test-*.zig
+test-*.c
+test-wrapper
+test-pure-c

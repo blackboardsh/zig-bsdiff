@@ -46,6 +46,10 @@ const zstd = @cImport({
     @cInclude("zstd.h");
 });
 
+const libsais = @cImport({
+    @cInclude("zig_wrapper.h");
+});
+
 const vectorSize = std.simd.suggestVectorLength(u8) orelse 4;
 
 // 1. create a bsdiff implementation that supports bzip2 classic bsdiff, and a mode that doesn't compress the patch file at all (so you can apply any compression to the whole file)
@@ -139,24 +143,40 @@ pub fn calculateDifferences(allocator: *std.mem.Allocator, oldData: []const u8, 
         std.debug.print("Block compression with bzip2 not yet implemented.\n", .{});
     }
 
-    // Start progress logging thread at the very beginning
-    var progressRunning: bool = true;
-    var progressPercent: f32 = 0.0;
-    var progressBytes: usize = 0;
-    var progressPhase: []const u8 = "Building suffix array";
-    const totalBytes = newData.len;
-    const progressThread = try std.Thread.spawn(.{}, logProgressPhase, .{ &progressRunning, &progressPercent, &progressBytes, totalBytes, &progressPhase });
-
     // Allocate memory for the suffix array based on the length of the old data
     const suffixIndexes = try allocator.alloc(i64, oldData.len + 1);
     defer allocator.free(suffixIndexes);
 
-    // Note: This is where a significant amount of time is spent in the diffing process
-    // Todo: replace with a more modern suffix sort algorithm like libdivsufsort
-    try qsufsortFast(allocator, suffixIndexes, oldData, &progressBytes, &progressPercent);
+    std.debug.print("Building suffix array with libsais64...\n", .{});
+    const saisStart = std.time.milliTimestamp();
 
-    // Switch to diffing phase
-    progressPhase = "Diffing";
+    // Use libsais64 for fast suffix array construction (3-7x faster than qsufsort)
+    const oldDataLen: i64 = @intCast(oldData.len);
+    const result = libsais.zig_libsais64_wrapper(
+        oldData.ptr,
+        suffixIndexes.ptr,
+        oldDataLen,
+    );
+
+    if (result != 0) {
+        std.debug.print("libsais64 failed with error code: {d}\n", .{result});
+        return error.SuffixArrayConstructionFailed;
+    }
+
+    const saisTime = std.time.milliTimestamp() - saisStart;
+    const saisTimeSec = @as(f64, @floatFromInt(saisTime)) / 1000.0;
+    std.debug.print("Suffix array built in {d:.2}s\n", .{saisTimeSec});
+
+    // Add sentinel value at the end (used by the original algorithm)
+    suffixIndexes[oldData.len] = @intCast(oldData.len);
+
+    // Start progress logging thread for the diffing phase
+    var progressRunning: bool = true;
+    var progressPercent: f32 = 0.0;
+    var progressBytes: usize = 0;
+    var progressPhase: []const u8 = "Diffing";
+    const totalBytes = newData.len;
+    const progressThread = try std.Thread.spawn(.{}, logProgressPhase, .{ &progressRunning, &progressPercent, &progressBytes, totalBytes, &progressPhase });
 
     const newsize = newData.len;
     const oldsize = oldData.len;
