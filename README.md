@@ -4,6 +4,8 @@ Fast binary diff/patch implementation in Zig with zstd compression.
 
 This is a high-performance port of bsdiff/bspatch that uses zstd compression instead of bzip2, providing better compression ratios and faster decompression speeds.
 
+zig-bsdiff powers [Electrobun](https://github.com/blackboardsh/electrobun/)'s batteries-included update api delivering update patches as small as 4KB for your apps.
+
 ## Features
 
 - **Fast**: Optimized with SIMD operations and efficient algorithms
