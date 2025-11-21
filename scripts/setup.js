@@ -8,7 +8,7 @@
  */
 
 import { execSync } from 'child_process';
-import { existsSync, mkdirSync, rmSync, unlinkSync, renameSync } from 'fs';
+import { existsSync, mkdirSync, rmSync, unlinkSync, renameSync, writeFileSync } from 'fs';
 import { join } from 'path';
 
 const ZIG_VERSION = '0.13.0';
@@ -57,10 +57,24 @@ async function vendorLibsais() {
     // Compile libsais (Zig's C backend has issues with libsais)
     console.log('Compiling libsais...');
 
-    // Use clang/gcc on all platforms for consistency
-    // This produces .a libraries that work with Zig's linker
+    const compiler = platform === 'win32' ? 'gcc' : 'clang';
+    const wrapperDir = join(process.cwd(), 'src', 'libsais-wrapper');
+
+    // Compile libsais source files
     execSync(
-      `cd ${libsaisDir} && ${platform === 'win32' ? 'gcc' : 'clang'} -c -O3 -std=c99 libsais.c libsais64.c zig_wrapper.c && ar rcs libsais.a libsais.o libsais64.o zig_wrapper.o`,
+      `cd ${libsaisDir} && ${compiler} -c -O3 -std=c99 libsais.c libsais64.c`,
+      { stdio: 'inherit' }
+    );
+
+    // Compile wrapper with include path to libsais headers
+    execSync(
+      `${compiler} -c -O3 -std=c99 -I ${libsaisDir} ${wrapperDir}/zig_wrapper.c -o ${libsaisDir}/zig_wrapper.o`,
+      { stdio: 'inherit' }
+    );
+
+    // Create static library
+    execSync(
+      `cd ${libsaisDir} && ar rcs libsais.a libsais.o libsais64.o zig_wrapper.o`,
       { stdio: 'inherit' }
     );
 

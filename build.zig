@@ -67,6 +67,7 @@ pub fn build(b: *std.Build) void {
     // This is for the cImport to import the .h files
     bsdiff.addIncludePath(b.path("zstd/lib"));
     bsdiff.addIncludePath(b.path("vendors/libsais"));
+    bsdiff.addIncludePath(b.path("src/libsais-wrapper"));
 
     b.installArtifact(bsdiff);
 
@@ -90,6 +91,7 @@ pub fn build(b: *std.Build) void {
 
     tests.addIncludePath(b.path("zstd/lib"));
     tests.addIncludePath(b.path("vendors/libsais"));
+    tests.addIncludePath(b.path("src/libsais-wrapper"));
     tests.linkLibrary(libzstd);
     tests.addObjectFile(b.path("vendors/libsais/libsais.a"));
 
