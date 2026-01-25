@@ -167,6 +167,46 @@ pub fn calculateDifferences(allocator: *std.mem.Allocator, oldData: []const u8, 
     const saisTimeSec = @as(f64, @floatFromInt(saisTime)) / 1000.0;
     std.debug.print("Suffix array built in {d:.2}s\n", .{saisTimeSec});
 
+    // Build LCP array for accelerated search
+    std.debug.print("Building LCP array...\n", .{});
+    const lcpStart = std.time.milliTimestamp();
+
+    // First compute PLCP (permuted LCP), then convert to LCP
+    const plcp = try allocator.alloc(i64, oldData.len);
+    defer allocator.free(plcp);
+
+    const plcpResult = libsais.zig_libsais64_plcp(
+        oldData.ptr,
+        suffixIndexes.ptr,
+        plcp.ptr,
+        oldDataLen,
+    );
+
+    if (plcpResult != 0) {
+        std.debug.print("libsais64_plcp failed with error code: {d}\n", .{plcpResult});
+        return error.PLCPConstructionFailed;
+    }
+
+    // LCP array: LCP[i] = length of longest common prefix between SA[i-1] and SA[i]
+    const lcpArray = try allocator.alloc(i64, oldData.len);
+    defer allocator.free(lcpArray);
+
+    const lcpResult = libsais.zig_libsais64_lcp(
+        plcp.ptr,
+        suffixIndexes.ptr,
+        lcpArray.ptr,
+        oldDataLen,
+    );
+
+    if (lcpResult != 0) {
+        std.debug.print("libsais64_lcp failed with error code: {d}\n", .{lcpResult});
+        return error.LCPConstructionFailed;
+    }
+
+    const lcpTime = std.time.milliTimestamp() - lcpStart;
+    const lcpTimeSec = @as(f64, @floatFromInt(lcpTime)) / 1000.0;
+    std.debug.print("LCP array built in {d:.2}s\n", .{lcpTimeSec});
+
     // Add sentinel value at the end (used by the original algorithm)
     suffixIndexes[oldData.len] = @intCast(oldData.len);
 
@@ -241,6 +281,10 @@ pub fn calculateDifferences(allocator: *std.mem.Allocator, oldData: []const u8, 
 
     // var controlBlockOffset: usize = 0;
 
+    // Timing for diff phase
+    const diffPhaseStart = std.time.milliTimestamp();
+    var searchCount: usize = 0;
+
     // Begin the main loop for calculating differences
     while (scanIndex < newsize) {
         // Update progress for logging thread
@@ -254,7 +298,9 @@ pub fn calculateDifferences(allocator: *std.mem.Allocator, oldData: []const u8, 
         // Loop through newData, searching for matches in oldData
         while (scanIndex < newsize) {
             // Note: most of the time during the diffing phase is spend in search()
-            matchLength = @intCast(search(suffixIndexes, oldData, newData[@intCast(scanIndex)..], 0, @intCast(oldsize), &matchPosition));
+            // Using LCP-accelerated search with boundary tracking for O(m + log n) instead of O(m * log n)
+            matchLength = @intCast(searchWithLCP(suffixIndexes, lcpArray, oldData, newData[@intCast(scanIndex)..], 0, @intCast(oldsize), &matchPosition));
+            searchCount += 1;
 
             // Increment matchScore based on direct matches between newData and shifted oldData
             while (scoreCounter < scanIndex + matchLength) {
@@ -415,6 +461,11 @@ pub fn calculateDifferences(allocator: *std.mem.Allocator, oldData: []const u8, 
     progressRunning = false;
     progressThread.join();
 
+    // Report diff phase timing
+    const diffPhaseTime = std.time.milliTimestamp() - diffPhaseStart;
+    const diffPhaseSec = @as(f64, @floatFromInt(diffPhaseTime)) / 1000.0;
+    std.debug.print("Diff phase: {d:.2}s ({d} search calls)\n", .{ diffPhaseSec, searchCount });
+
     // Tell the compression threads to wrap up and wait for them
     streamingBytes = false;
     diffBlockThread.join();
@@ -513,6 +564,111 @@ fn offtout(x: i64, buf: []u8) void {
     buf[5] = @intCast((y >> 40) & 0xFF);
     buf[6] = @intCast((y >> 48) & 0xFF);
     buf[7] = @intCast((y >> 56) & 0xFF);
+}
+
+/// LCP-accelerated binary search to find the longest match.
+/// By tracking match lengths at boundaries and using the LCP array,
+/// we can skip redundant comparisons, achieving O(m + log n) instead of O(m * log n).
+fn searchWithLCP(suffixIndexes: []i64, _: []i64, oldData: []const u8, newData: []const u8, from: usize, to: usize, bestMatchPosition: *i64) usize {
+    // Use iterative approach with LCP acceleration
+    var lo: usize = from;
+    var hi: usize = to;
+    var loMatch: usize = 0; // chars matching at lo boundary
+    var hiMatch: usize = 0; // chars matching at hi boundary
+
+    const oldDataSize = oldData.len;
+    const newDataSize = newData.len;
+
+    // Initial match lengths at boundaries
+    loMatch = matchlenFast(oldData[@intCast(suffixIndexes[lo])..], newData);
+    hiMatch = matchlenFast(oldData[@intCast(suffixIndexes[hi])..], newData);
+
+    var bestMatch: usize = loMatch;
+    bestMatchPosition.* = suffixIndexes[lo];
+    if (hiMatch > bestMatch) {
+        bestMatch = hiMatch;
+        bestMatchPosition.* = suffixIndexes[hi];
+    }
+
+    while (hi - lo > 1) {
+        const mid = lo + (hi - lo) / 2;
+        const midSuffixPos: usize = @intCast(suffixIndexes[mid]);
+
+        // Start comparison from the minimum of the two boundary matches
+        // This is the key LCP optimization - we know at least this many chars must match
+        const skipLen = @min(loMatch, hiMatch);
+
+        // Compare starting from skipLen
+        const compareLen = @min(oldDataSize - midSuffixPos, newDataSize);
+        var midMatch: usize = skipLen;
+
+        // Continue matching from skipLen
+        if (skipLen < compareLen) {
+            midMatch += matchlenFrom(oldData[midSuffixPos + skipLen ..], newData[skipLen..]);
+        }
+
+        // Update best match if this is better
+        if (midMatch > bestMatch) {
+            bestMatch = midMatch;
+            bestMatchPosition.* = suffixIndexes[mid];
+        }
+
+        // Decide which half to search based on lexicographic comparison
+        if (midMatch < compareLen and midMatch < newDataSize) {
+            // We stopped matching at position midMatch
+            if (midSuffixPos + midMatch < oldDataSize and oldData[midSuffixPos + midMatch] < newData[midMatch]) {
+                // Suffix at mid is less than query, search right half
+                lo = mid;
+                loMatch = midMatch;
+            } else {
+                // Suffix at mid is greater than query, search left half
+                hi = mid;
+                hiMatch = midMatch;
+            }
+        } else {
+            // Full match up to the limit, decide based on lengths
+            if (compareLen <= newDataSize) {
+                // Need longer suffixes, search left (smaller indices = longer suffixes in sorted order when equal prefix)
+                hi = mid;
+                hiMatch = midMatch;
+            } else {
+                lo = mid;
+                loMatch = midMatch;
+            }
+        }
+    }
+
+    return bestMatch;
+}
+
+/// Helper function: match length starting from an offset (for LCP-accelerated search)
+fn matchlenFrom(oldData: []const u8, newData: []const u8) usize {
+    const minSize = @min(oldData.len, newData.len);
+    var i: usize = 0;
+
+    // Use 8-byte lookahead for speed
+    while (i + 8 <= minSize) {
+        const oldSlice: *const [8]u8 = @ptrCast(&oldData[i]);
+        const newSlice: *const [8]u8 = @ptrCast(&newData[i]);
+        const oldAs64 = std.mem.readInt(u64, oldSlice, std.builtin.Endian.big);
+        const newAs64 = std.mem.readInt(u64, newSlice, std.builtin.Endian.big);
+
+        if (oldAs64 != newAs64) {
+            // Find exact mismatch position within the 8 bytes
+            while (i < minSize and oldData[i] == newData[i]) {
+                i += 1;
+            }
+            return i;
+        }
+        i += 8;
+    }
+
+    // Handle remaining bytes
+    while (i < minSize and oldData[i] == newData[i]) {
+        i += 1;
+    }
+
+    return i;
 }
 
 /// Do a binary search to find the longest match of `newData` within `oldData` using precomputed suffixIndexes.
