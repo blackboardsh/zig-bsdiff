@@ -52,6 +52,23 @@ const libsais = @cImport({
 
 const vectorSize = std.simd.suggestVectorLength(u8) orelse 4;
 
+// Result from processing a single chunk
+const ChunkResult = struct {
+    // Control block entries: each entry is 3 x i64 (forwardLen, extraLen, seekBy)
+    controlData: []u8,
+    controlLen: usize,
+    // Diff bytes
+    diffData: []u8,
+    diffLen: usize,
+    // Extra bytes
+    extraData: []u8,
+    extraLen: usize,
+    // Where this chunk actually ended in newData (may extend past nominal boundary)
+    actualEndPos: usize,
+    // Where this chunk started
+    startPos: usize,
+};
+
 // 1. create a bsdiff implementation that supports bzip2 classic bsdiff, and a mode that doesn't compress the patch file at all (so you can apply any compression to the whole file)
 // since only the electrobun cli needs to compress the file size doesn't matter, we just need prebuilt binaries to electrobun build on different platforms
 // 2. compile binaries for every target platform of bsdiff and bspatch with/without bzip2 compression.
@@ -210,267 +227,217 @@ pub fn calculateDifferences(allocator: *std.mem.Allocator, oldData: []const u8, 
     // Add sentinel value at the end (used by the original algorithm)
     suffixIndexes[oldData.len] = @intCast(oldData.len);
 
-    // Start progress logging thread for the diffing phase
-    var progressRunning: bool = true;
-    var progressPercent: f32 = 0.0;
-    var progressBytes: usize = 0;
-    var progressPhase: []const u8 = "Diffing";
-    const totalBytes = newData.len;
-    const progressThread = try std.Thread.spawn(.{}, logProgressPhase, .{ &progressRunning, &progressPercent, &progressBytes, totalBytes, &progressPhase });
-
     const newsize = newData.len;
-    const oldsize = oldData.len;
-
-    var streamingBytes = true;
-    // compression threads
-    // control block - each triplet is 24 bytes, ensure minimum buffer size
-    var controlBlockStreamOffset: usize = 0;
-    var controlBlockStream = try allocator.alloc(u8, @max(newsize, 64 * 1024));
-    var controlBlockInput = zstd.ZSTD_inBuffer{ .src = controlBlockStream.ptr, .size = 0, .pos = 0 };
-    const controlBlockCompressed = try allocator.alloc(u8, zstd.ZSTD_compressBound(controlBlockStream.len));
-    var controlBlockOutput = zstd.ZSTD_outBuffer{ .dst = controlBlockCompressed.ptr, .size = controlBlockCompressed.len, .pos = 0 };
-    const controlBlockThread = try std.Thread.spawn(.{}, compressBlockStream, .{ &controlBlockInput, &controlBlockOutput, &streamingBytes });
-    // diff block
-    // var diffBlockStreamOffset: usize = 0;
-    var diffBlockStream = try allocator.alloc(u8, newsize);
-    var diffBlockInput = zstd.ZSTD_inBuffer{ .src = diffBlockStream.ptr, .size = 0, .pos = 0 };
-    const diffBlockCompressed = try allocator.alloc(u8, zstd.ZSTD_compressBound(diffBlockStream.len));
-    var diffBlockOutput = zstd.ZSTD_outBuffer{ .dst = diffBlockCompressed.ptr, .size = diffBlockCompressed.len, .pos = 0 };
-    const diffBlockThread = try std.Thread.spawn(.{}, compressBlockStream, .{ &diffBlockInput, &diffBlockOutput, &streamingBytes });
-    // extra block
-    var extraBlockStream = try allocator.alloc(u8, newsize);
-    var extraBlockInput = zstd.ZSTD_inBuffer{ .src = extraBlockStream.ptr, .size = 0, .pos = 0 };
-    const extraBlockCompressed = try allocator.alloc(u8, zstd.ZSTD_compressBound(extraBlockStream.len));
-    var extraBlockOutput = zstd.ZSTD_outBuffer{ .dst = extraBlockCompressed.ptr, .size = extraBlockCompressed.len, .pos = 0 };
-    const extraBlockThread = try std.Thread.spawn(.{}, compressBlockStream, .{ &extraBlockInput, &extraBlockOutput, &streamingBytes });
-
-    // Header is
-    //	0	8	"BSDIFF40" or "TRDIFF10" // The only difference in file format is bzip2 vs zstd compression of the blocks
-    //	8	8	length of ctrl block  i64
-    //	16	8	length of diff block  i64
-    //	24	8	length of extra block i64
-    // File is
-    //  0	32	Header
-    //  32	??	ctrl block  uncompresses to i64
-    //  ??	??	diff block  uncompresses to i8
-    //  ??	??	extra block uncompresses to u8
-
-    // Placeholder for the buffer used in offtout
-    var buffer = [_]u8{0} ** 8;
-
-    // Initialize variables for tracking positions and scores during the diffing process
-    var scanIndex: i64 = 0;
-    var matchLength: i64 = 0;
-    var lastScanIndex: i64 = 0;
-    var lastMatchPosition: i64 = 0;
-    var lastOffset: i64 = 0;
-    var matchScore: i64 = 0;
-    var matchPosition: i64 = 0;
-
-    // More variables for managing the diffing process
-    var scoreCounter: i64 = 0;
-    var forwardScore: i64 = 0;
-    var forwardLength: i64 = 0;
-    var backwardScore: i64 = 0;
-    var backwardLength: i64 = 0;
-
-    // Variables for handling overlaps in the diffing process
-    var overlapLength: i64 = 0;
-    var bestOverlapScore: i64 = 0;
-    var bestOverlapLength: i64 = 0;
-
-    // var controlBlockOffset: usize = 0;
 
     // Timing for diff phase
     const diffPhaseStart = std.time.milliTimestamp();
-    var searchCount: usize = 0;
 
-    // Begin the main loop for calculating differences
-    while (scanIndex < newsize) {
-        // Update progress for logging thread
-        progressBytes = @intCast(scanIndex);
-        progressPercent = (@as(f32, @floatFromInt(scanIndex)) / @as(f32, @floatFromInt(newsize))) * 100.0;
+    // Determine number of chunks based on CPU count
+    const cpuCount = std.Thread.getCpuCount() catch 4;
+    // Use at most 8 threads, at least 1, and ensure chunks are at least 1MB
+    const minChunkSize: usize = 1024 * 1024; // 1MB minimum
+    const maxThreads = @min(cpuCount, 8);
+    // Set to true for parallel processing, false for single-threaded
+    const useParallel = true;
+    const numChunks = if (useParallel) @max(1, @min(maxThreads, newsize / minChunkSize)) else 1;
 
-        matchScore = 0;
-        scanIndex += matchLength;
-        scoreCounter = scanIndex;
+    std.debug.print("Parallel diff with {d} chunks on {d} CPUs...\n", .{ numChunks, cpuCount });
 
-        // Loop through newData, searching for matches in oldData
-        while (scanIndex < newsize) {
-            // Note: most of the time during the diffing phase is spend in search()
-            // Using LCP-accelerated search with boundary tracking for O(m + log n) instead of O(m * log n)
-            matchLength = @intCast(searchWithLCP(suffixIndexes, lcpArray, oldData, newData[@intCast(scanIndex)..], 0, @intCast(oldsize), &matchPosition));
-            searchCount += 1;
+    // Calculate chunk boundaries
+    const chunkSize = (newsize + numChunks - 1) / numChunks;
 
-            // Increment matchScore based on direct matches between newData and shifted oldData
-            while (scoreCounter < scanIndex + matchLength) {
-                const currentScanPos = scoreCounter + lastOffset;
-                if (currentScanPos < oldsize and oldData[@intCast(currentScanPos)] == newData[@intCast(scoreCounter)]) {
-                    matchScore += 1;
-                }
-                scoreCounter += 1;
-            }
+    // Allocate results array and threads array
+    var chunkResults = try allocator.alloc(ChunkResult, numChunks);
+    defer allocator.free(chunkResults);
 
-            // Break conditions for optimizing the search process
-            if (matchLength == matchScore and matchLength != 0) {
-                break;
-            }
-            if (matchLength > matchScore + 8) {
-                break;
-            }
-            if (scanIndex + lastOffset < oldsize and oldData[@intCast(scanIndex + lastOffset)] == newData[@intCast(scanIndex)]) {
-                matchScore -= 1;
-            }
+    var threads = try allocator.alloc(std.Thread, numChunks);
+    defer allocator.free(threads);
 
-            scanIndex += 1;
-        }
+    // Spawn threads for each chunk
+    for (0..numChunks) |i| {
+        const chunkStart = i * chunkSize;
+        const nominalEnd = @min((i + 1) * chunkSize, newsize);
 
-        // After finding a match, calculate the forward and backward lengths for the diff and extra blocks
-        if (matchLength != matchScore or scanIndex == newsize) {
-            scoreCounter = 0;
-            forwardScore = 0;
-            forwardLength = 0;
-            var i: i64 = 0;
-
-            // Calculate forward length - how much data from the old file matches directly after the current position
-            while (lastScanIndex + i < scanIndex and lastMatchPosition + i < oldsize) {
-                if (oldData[@intCast(lastMatchPosition + i)] == newData[@intCast(lastScanIndex + i)]) {
-                    scoreCounter += 1;
-                }
-                i += 1;
-                if (scoreCounter * 2 - i > forwardScore * 2 - forwardLength) {
-                    forwardScore = scoreCounter;
-                    forwardLength = i;
-                }
-            }
-
-            // Calculate backward length - similar to forward length but in the opposite direction
-            backwardLength = 0;
-            if (scanIndex < newsize) {
-                scoreCounter = 0;
-                backwardScore = 0;
-                i = 1;
-                while (scanIndex >= lastScanIndex + i and matchPosition >= i) {
-                    if (oldData[@intCast(matchPosition - i)] == newData[@intCast(scanIndex - i)]) {
-                        scoreCounter += 1;
-                    }
-                    if (scoreCounter * 2 - i > backwardScore * 2 - backwardLength) {
-                        backwardScore = scoreCounter;
-                        backwardLength = i;
-                    }
-                    i += 1;
-                }
-            }
-
-            // Handle overlaps between forward and backward matches
-            if (lastScanIndex + forwardLength > scanIndex - backwardLength) {
-                overlapLength = (lastScanIndex + forwardLength) - (scanIndex - backwardLength);
-                scoreCounter = 0;
-                bestOverlapScore = 0;
-                bestOverlapLength = 0;
-                i = 0;
-
-                while (i < overlapLength) {
-                    if (newData[@intCast(lastScanIndex + forwardLength - overlapLength + i)] == oldData[@intCast(lastMatchPosition + forwardLength - overlapLength + i)]) {
-                        scoreCounter += 1;
-                    }
-
-                    if (newData[@intCast(scanIndex - backwardLength + i)] == oldData[@intCast(matchPosition - backwardLength + i)]) {
-                        scoreCounter -= 1;
-                    }
-
-                    if (scoreCounter > bestOverlapScore) {
-                        bestOverlapScore = scoreCounter;
-                        bestOverlapLength = i + 1;
-                    }
-
-                    i += 1;
-                }
-
-                forwardLength += bestOverlapLength - overlapLength;
-                backwardLength -= bestOverlapLength;
-            }
-
-            i = 0;
-
-            // Write the calculated diff and extra data to their respective blocks
-            while (i < forwardLength) {
-                // perf: use simd for calculations where possible
-                if (i + vectorSize <= forwardLength) {
-                    const oldpos: usize = @intCast(lastMatchPosition + i);
-                    const newpos: usize = @intCast(lastScanIndex + i);
-                    const diffpos: usize = @intCast(diffBlockInput.size + @as(usize, @intCast(i)));
-
-                    const newVec: @Vector(vectorSize, u8) = newData[newpos..][0..vectorSize].*;
-                    const oldVec: @Vector(vectorSize, u8) = oldData[oldpos..][0..vectorSize].*;
-                    const resultVec = @subWithOverflow(newVec, oldVec)[0];
-                    const resultArray: [vectorSize]u8 = resultVec;
-                    @memcpy(diffBlockStream[diffpos..][0..vectorSize], &resultArray);
-
-                    i += vectorSize;
-                    continue;
-                }
-
-                const newByte: u8 = newData[@intCast(lastScanIndex + i)];
-                const oldByte: u8 = oldData[@intCast(lastMatchPosition + i)];
-                const diffByte: u8 = @subWithOverflow(newByte, oldByte)[0];
-
-                diffBlockStream[@intCast(diffBlockInput.size + @as(usize, @intCast(i)))] = diffByte;
-
-                i += 1;
-            }
-
-            i = 0;
-
-            // Write extra data that doesn't match directly but needs to be added to the new data
-            const newBytesAded = (scanIndex - backwardLength) - (lastScanIndex + forwardLength);
-
-            // Note: Oddly doing a @memcpy here is significantly slower than a loop
-            while (i < newBytesAded) {
-                // extraBlock[@intCast(extraBlockInput.size + @as(usize, @intCast(i)))] = newData[@intCast(lastScanIndex + forwardLength + i)];
-                extraBlockStream[@intCast(extraBlockInput.size + @as(usize, @intCast(i)))] = newData[@intCast(lastScanIndex + forwardLength + i)];
-                i += 1;
-            }
-
-            const readDiffBy = forwardLength;
-            const readExtraBy = newBytesAded;
-            const seekBy = (matchPosition - backwardLength) - (lastMatchPosition + forwardLength);
-
-            // Update lengths and control block information for the next iteration
-            diffBlockInput.size += @intCast(readDiffBy);
-            extraBlockInput.size += @intCast(readExtraBy);
-
-            offtout(readDiffBy, controlBlockStream[controlBlockStreamOffset..][0..8]);
-            controlBlockStreamOffset += 8;
-            offtout(readExtraBy, controlBlockStream[controlBlockStreamOffset..][0..8]);
-            controlBlockStreamOffset += 8;
-            offtout(seekBy, controlBlockStream[controlBlockStreamOffset..][0..8]);
-            controlBlockStreamOffset += 8;
-            controlBlockInput.size = controlBlockStreamOffset;
-
-            // Update positions for the next loop iteration
-            lastScanIndex = scanIndex - backwardLength;
-            lastMatchPosition = matchPosition - backwardLength;
-            lastOffset = matchPosition - scanIndex;
-        }
+        threads[i] = try std.Thread.spawn(.{}, processChunkThread, .{
+            &chunkResults[i],
+            allocator.*,
+            suffixIndexes,
+            lcpArray,
+            oldData,
+            newData,
+            chunkStart,
+            nominalEnd,
+        });
     }
 
-    // Stop progress logging
-    progressBytes = newsize;
-    progressPercent = 100.0;
-    progressRunning = false;
-    progressThread.join();
+    // Wait for all threads to complete
+    for (threads) |thread| {
+        thread.join();
+    }
 
     // Report diff phase timing
     const diffPhaseTime = std.time.milliTimestamp() - diffPhaseStart;
     const diffPhaseSec = @as(f64, @floatFromInt(diffPhaseTime)) / 1000.0;
-    std.debug.print("Diff phase: {d:.2}s ({d} search calls)\n", .{ diffPhaseSec, searchCount });
+    std.debug.print("Diff phase: {d:.2}s (parallel)\n", .{diffPhaseSec});
 
-    // Tell the compression threads to wrap up and wait for them
+    // Merge chunk results, handling overlaps
+    // If chunk N extended past its boundary into chunk N+1's territory,
+    // we need to discard the overlapping portion from chunk N+1
+
+    // First, calculate total sizes needed
+    var totalControlLen: usize = 0;
+    var totalDiffLen: usize = 0;
+    var totalExtraLen: usize = 0;
+
+    // Track where each chunk's data actually starts (after discarding overlaps)
+    var chunkDataStarts = try allocator.alloc(usize, numChunks);
+    defer allocator.free(chunkDataStarts);
+
+    for (0..numChunks) |i| {
+        var startOffset: usize = 0;
+
+        // Check if previous chunk extended into this chunk's territory
+        if (i > 0) {
+            const prevActualEnd = chunkResults[i - 1].actualEndPos;
+            const thisStart = chunkResults[i].startPos;
+
+            if (prevActualEnd > thisStart) {
+                // Previous chunk extended into our territory
+                // We need to skip control blocks until we're past the overlap
+                // Each control block covers some portion of newData
+                // We need to figure out how many bytes of newData our control blocks cover
+                // and skip until we're past prevActualEnd
+
+                var newDataCovered: usize = thisStart;
+                var controlOffset: usize = 0;
+                var diffOffset: usize = 0;
+                var extraOffset: usize = 0;
+
+                while (controlOffset < chunkResults[i].controlLen and newDataCovered < prevActualEnd) {
+                    // Read the control block
+                    const forwardLen = offtin(chunkResults[i].controlData[controlOffset..][0..8]);
+                    const extraLen = offtin(chunkResults[i].controlData[controlOffset + 8 ..][0..16][0..8]);
+
+                    // This control block covers forwardLen + extraLen bytes of newData
+                    newDataCovered += @intCast(forwardLen + extraLen);
+
+                    controlOffset += 24;
+                    diffOffset += @intCast(forwardLen);
+                    extraOffset += @intCast(extraLen);
+                }
+
+                startOffset = controlOffset;
+                // Store the offsets we need to skip
+                chunkDataStarts[i] = startOffset;
+
+                // Adjust the lengths to account for skipped data
+                totalControlLen += chunkResults[i].controlLen - controlOffset;
+                totalDiffLen += chunkResults[i].diffLen - diffOffset;
+                totalExtraLen += chunkResults[i].extraLen - extraOffset;
+            } else {
+                chunkDataStarts[i] = 0;
+                totalControlLen += chunkResults[i].controlLen;
+                totalDiffLen += chunkResults[i].diffLen;
+                totalExtraLen += chunkResults[i].extraLen;
+            }
+        } else {
+            chunkDataStarts[i] = 0;
+            totalControlLen += chunkResults[i].controlLen;
+            totalDiffLen += chunkResults[i].diffLen;
+            totalExtraLen += chunkResults[i].extraLen;
+        }
+    }
+
+    // Allocate merged buffers
+    var controlBlockStream = try allocator.alloc(u8, @max(totalControlLen, 64 * 1024));
+    var diffBlockStream = try allocator.alloc(u8, @max(totalDiffLen, 1024));
+    var extraBlockStream = try allocator.alloc(u8, @max(totalExtraLen, 1024));
+
+    // Copy data from chunks, skipping overlaps
+    var controlOffset: usize = 0;
+    var diffOffset: usize = 0;
+    var extraOffset: usize = 0;
+
+    for (0..numChunks) |i| {
+        const skipControlBytes = chunkDataStarts[i];
+
+        // Calculate corresponding diff/extra skip amounts by parsing skipped control blocks
+        var skipDiffBytes: usize = 0;
+        var skipExtraBytes: usize = 0;
+        var ctrlPos: usize = 0;
+        while (ctrlPos < skipControlBytes) {
+            const forwardLen = offtin(chunkResults[i].controlData[ctrlPos..][0..8]);
+            const extraLen = offtin(chunkResults[i].controlData[ctrlPos + 8 ..][0..16][0..8]);
+            skipDiffBytes += @intCast(forwardLen);
+            skipExtraBytes += @intCast(extraLen);
+            ctrlPos += 24;
+        }
+
+        const controlToCopy = chunkResults[i].controlLen - skipControlBytes;
+        const diffToCopy = chunkResults[i].diffLen - skipDiffBytes;
+        const extraToCopy = chunkResults[i].extraLen - skipExtraBytes;
+
+        if (controlToCopy > 0) {
+            @memcpy(controlBlockStream[controlOffset..][0..controlToCopy], chunkResults[i].controlData[skipControlBytes..][0..controlToCopy]);
+            controlOffset += controlToCopy;
+        }
+
+        if (diffToCopy > 0) {
+            @memcpy(diffBlockStream[diffOffset..][0..diffToCopy], chunkResults[i].diffData[skipDiffBytes..][0..diffToCopy]);
+            diffOffset += diffToCopy;
+        }
+
+        if (extraToCopy > 0) {
+            @memcpy(extraBlockStream[extraOffset..][0..extraToCopy], chunkResults[i].extraData[skipExtraBytes..][0..extraToCopy]);
+            extraOffset += extraToCopy;
+        }
+
+        // Free chunk data
+        allocator.free(chunkResults[i].controlData);
+        allocator.free(chunkResults[i].diffData);
+        allocator.free(chunkResults[i].extraData);
+    }
+
+    // Now compress the merged data
+    std.debug.print("Compressing...\n", .{});
+    const compressStart = std.time.milliTimestamp();
+
+    var streamingBytes = true;
+    var controlBlockInput = zstd.ZSTD_inBuffer{ .src = controlBlockStream.ptr, .size = controlOffset, .pos = 0 };
+    const controlBlockCompressed = try allocator.alloc(u8, zstd.ZSTD_compressBound(controlOffset));
+    var controlBlockOutput = zstd.ZSTD_outBuffer{ .dst = controlBlockCompressed.ptr, .size = controlBlockCompressed.len, .pos = 0 };
+    const controlBlockThread = try std.Thread.spawn(.{}, compressBlockStream, .{ &controlBlockInput, &controlBlockOutput, &streamingBytes });
+
+    var diffBlockInput = zstd.ZSTD_inBuffer{ .src = diffBlockStream.ptr, .size = diffOffset, .pos = 0 };
+    const diffBlockCompressed = try allocator.alloc(u8, zstd.ZSTD_compressBound(diffOffset));
+    var diffBlockOutput = zstd.ZSTD_outBuffer{ .dst = diffBlockCompressed.ptr, .size = diffBlockCompressed.len, .pos = 0 };
+    const diffBlockThread = try std.Thread.spawn(.{}, compressBlockStream, .{ &diffBlockInput, &diffBlockOutput, &streamingBytes });
+
+    var extraBlockInput = zstd.ZSTD_inBuffer{ .src = extraBlockStream.ptr, .size = extraOffset, .pos = 0 };
+    const extraBlockCompressed = try allocator.alloc(u8, zstd.ZSTD_compressBound(extraOffset));
+    var extraBlockOutput = zstd.ZSTD_outBuffer{ .dst = extraBlockCompressed.ptr, .size = extraBlockCompressed.len, .pos = 0 };
+    const extraBlockThread = try std.Thread.spawn(.{}, compressBlockStream, .{ &extraBlockInput, &extraBlockOutput, &streamingBytes });
+
+    // Wait a bit then signal completion
+    std.time.sleep(std.time.ns_per_ms * 10);
     streamingBytes = false;
-    diffBlockThread.join();
+
     controlBlockThread.join();
+    diffBlockThread.join();
     extraBlockThread.join();
+
+    const compressTime = std.time.milliTimestamp() - compressStart;
+    const compressTimeSec = @as(f64, @floatFromInt(compressTime)) / 1000.0;
+    std.debug.print("Compression: {d:.2}s\n", .{compressTimeSec});
+
+    // Header is
+    //	0	8	"BSDIFF40" or "TRDIFF10"
+    //	8	8	length of ctrl block  i64
+    //	16	8	length of diff block  i64
+    //	24	8	length of new file    i64
+
+    // Placeholder for the buffer used in offtout
+    var buffer = [_]u8{0} ** 8;
 
     // Combine header, diffBlock, and extraBlock into a single byte slice to return
     const headerLength = 32;
@@ -503,6 +470,241 @@ pub fn calculateDifferences(allocator: *std.mem.Allocator, oldData: []const u8, 
     std.debug.print("Completed - Patch: {d:.2} KB ({d:.1}% of new size)\n", .{ patchSizeKB, compressionRatio });
 
     return patch;
+}
+
+/// Process a chunk of the new file, finding matches in the old file.
+/// If a match extends past the nominal boundary, we continue until the match ends.
+fn processChunk(
+    allocator: std.mem.Allocator,
+    suffixIndexes: []i64,
+    lcpArray: []i64,
+    oldData: []const u8,
+    newData: []const u8,
+    chunkStart: usize,
+    nominalEnd: usize,
+) !ChunkResult {
+    const newsize = newData.len;
+    const oldsize = oldData.len;
+
+    // Allocate buffers for this chunk's output
+    // Chunks can extend significantly past their boundary if there's a long match
+    // Allocate generously - up to the full remaining file size in worst case
+    const remainingSize = newData.len - chunkStart;
+    const maxControlSize = @max((remainingSize / 8) * 24, 64 * 1024); // Rough estimate
+    var controlData = try allocator.alloc(u8, maxControlSize);
+    var controlLen: usize = 0;
+
+    var diffData = try allocator.alloc(u8, remainingSize);
+    var diffLen: usize = 0;
+
+    var extraData = try allocator.alloc(u8, remainingSize);
+    var extraLen: usize = 0;
+
+    // Initialize variables for tracking positions and scores
+    var scanIndex: i64 = @intCast(chunkStart);
+    var matchLength: i64 = 0;
+    var lastScanIndex: i64 = @intCast(chunkStart);
+    var lastMatchPosition: i64 = 0;
+    var lastOffset: i64 = 0;
+    var matchScore: i64 = 0;
+    var matchPosition: i64 = 0;
+
+    var scoreCounter: i64 = 0;
+    var forwardScore: i64 = 0;
+    var forwardLength: i64 = 0;
+    var backwardScore: i64 = 0;
+    var backwardLength: i64 = 0;
+
+    var overlapLength: i64 = 0;
+    var bestOverlapScore: i64 = 0;
+    var bestOverlapLength: i64 = 0;
+
+    // Track if we're in the middle of a match when we hit the boundary
+    var actualEndPos: usize = chunkStart;
+
+    // Main diff loop for this chunk
+    while (scanIndex < newsize) {
+        matchScore = 0;
+        scanIndex += matchLength;
+        scoreCounter = scanIndex;
+
+        // Search for matches
+        while (scanIndex < newsize) {
+            matchLength = @intCast(searchWithLCP(suffixIndexes, lcpArray, oldData, newData[@intCast(scanIndex)..], 0, @intCast(oldsize), &matchPosition));
+
+            while (scoreCounter < scanIndex + matchLength) {
+                const currentScanPos = scoreCounter + lastOffset;
+                if (currentScanPos >= 0 and currentScanPos < oldsize and oldData[@intCast(currentScanPos)] == newData[@intCast(scoreCounter)]) {
+                    matchScore += 1;
+                }
+                scoreCounter += 1;
+            }
+
+            if (matchLength == matchScore and matchLength != 0) {
+                break;
+            }
+            if (matchLength > matchScore + 8) {
+                break;
+            }
+            if (scanIndex + lastOffset >= 0 and scanIndex + lastOffset < oldsize and oldData[@intCast(scanIndex + lastOffset)] == newData[@intCast(scanIndex)]) {
+                matchScore -= 1;
+            }
+
+            scanIndex += 1;
+        }
+
+        // Process the match
+        if (matchLength != matchScore or scanIndex >= newsize) {
+            scoreCounter = 0;
+            forwardScore = 0;
+            forwardLength = 0;
+            var i: i64 = 0;
+
+            // Calculate forward length
+            while (lastScanIndex + i < scanIndex and lastMatchPosition + i < oldsize) {
+                if (oldData[@intCast(lastMatchPosition + i)] == newData[@intCast(lastScanIndex + i)]) {
+                    scoreCounter += 1;
+                }
+                i += 1;
+                if (scoreCounter * 2 - i > forwardScore * 2 - forwardLength) {
+                    forwardScore = scoreCounter;
+                    forwardLength = i;
+                }
+            }
+
+            // Calculate backward length
+            backwardLength = 0;
+            if (scanIndex < newsize) {
+                scoreCounter = 0;
+                backwardScore = 0;
+                i = 1;
+                while (scanIndex >= lastScanIndex + i and matchPosition >= i) {
+                    if (oldData[@intCast(matchPosition - i)] == newData[@intCast(scanIndex - i)]) {
+                        scoreCounter += 1;
+                    }
+                    if (scoreCounter * 2 - i > backwardScore * 2 - backwardLength) {
+                        backwardScore = scoreCounter;
+                        backwardLength = i;
+                    }
+                    i += 1;
+                }
+            }
+
+            // Handle overlaps
+            if (lastScanIndex + forwardLength > scanIndex - backwardLength) {
+                overlapLength = (lastScanIndex + forwardLength) - (scanIndex - backwardLength);
+                scoreCounter = 0;
+                bestOverlapScore = 0;
+                bestOverlapLength = 0;
+                i = 0;
+
+                while (i < overlapLength) {
+                    if (newData[@intCast(lastScanIndex + forwardLength - overlapLength + i)] == oldData[@intCast(lastMatchPosition + forwardLength - overlapLength + i)]) {
+                        scoreCounter += 1;
+                    }
+                    if (newData[@intCast(scanIndex - backwardLength + i)] == oldData[@intCast(matchPosition - backwardLength + i)]) {
+                        scoreCounter -= 1;
+                    }
+                    if (scoreCounter > bestOverlapScore) {
+                        bestOverlapScore = scoreCounter;
+                        bestOverlapLength = i + 1;
+                    }
+                    i += 1;
+                }
+
+                forwardLength += bestOverlapLength - overlapLength;
+                backwardLength -= bestOverlapLength;
+            }
+
+            // Write diff data
+            i = 0;
+            while (i < forwardLength) {
+                if (i + vectorSize <= forwardLength) {
+                    const oldpos: usize = @intCast(lastMatchPosition + i);
+                    const newpos: usize = @intCast(lastScanIndex + i);
+
+                    const newVec: @Vector(vectorSize, u8) = newData[newpos..][0..vectorSize].*;
+                    const oldVec: @Vector(vectorSize, u8) = oldData[oldpos..][0..vectorSize].*;
+                    const resultVec = @subWithOverflow(newVec, oldVec)[0];
+                    const resultArray: [vectorSize]u8 = resultVec;
+                    @memcpy(diffData[diffLen + @as(usize, @intCast(i)) ..][0..vectorSize], &resultArray);
+
+                    i += vectorSize;
+                    continue;
+                }
+
+                const newByte: u8 = newData[@intCast(lastScanIndex + i)];
+                const oldByte: u8 = oldData[@intCast(lastMatchPosition + i)];
+                diffData[diffLen + @as(usize, @intCast(i))] = @subWithOverflow(newByte, oldByte)[0];
+                i += 1;
+            }
+
+            // Write extra data
+            const newBytesAdded = (scanIndex - backwardLength) - (lastScanIndex + forwardLength);
+            i = 0;
+            while (i < newBytesAdded) {
+                extraData[extraLen + @as(usize, @intCast(i))] = newData[@intCast(lastScanIndex + forwardLength + i)];
+                i += 1;
+            }
+
+            // Write control block
+            const readDiffBy = forwardLength;
+            const readExtraBy = newBytesAdded;
+            const seekBy = (matchPosition - backwardLength) - (lastMatchPosition + forwardLength);
+
+            offtout(readDiffBy, controlData[controlLen..][0..8]);
+            controlLen += 8;
+            offtout(readExtraBy, controlData[controlLen..][0..8]);
+            controlLen += 8;
+            offtout(seekBy, controlData[controlLen..][0..8]);
+            controlLen += 8;
+
+            diffLen += @intCast(readDiffBy);
+            extraLen += @intCast(readExtraBy);
+
+            // Update positions
+            lastScanIndex = scanIndex - backwardLength;
+            lastMatchPosition = matchPosition - backwardLength;
+            lastOffset = matchPosition - scanIndex;
+
+            // Update actual end position
+            actualEndPos = @intCast(lastScanIndex);
+
+            // Check if we've passed the nominal boundary after completing this match
+            // We stop once we've finished a match that ends past the boundary
+            if (@as(usize, @intCast(lastScanIndex)) >= nominalEnd) {
+                break;
+            }
+        }
+    }
+
+    return ChunkResult{
+        .controlData = controlData,
+        .controlLen = controlLen,
+        .diffData = diffData,
+        .diffLen = diffLen,
+        .extraData = extraData,
+        .extraLen = extraLen,
+        .actualEndPos = actualEndPos,
+        .startPos = chunkStart,
+    };
+}
+
+/// Thread wrapper for processChunk
+fn processChunkThread(
+    result: *ChunkResult,
+    allocator: std.mem.Allocator,
+    suffixIndexes: []i64,
+    lcpArray: []i64,
+    oldData: []const u8,
+    newData: []const u8,
+    chunkStart: usize,
+    nominalEnd: usize,
+) void {
+    result.* = processChunk(allocator, suffixIndexes, lcpArray, oldData, newData, chunkStart, nominalEnd) catch |err| {
+        std.debug.print("Chunk processing error: {}\n", .{err});
+        return;
+    };
 }
 
 var totalCompressedSize: usize = 0;
@@ -545,6 +747,23 @@ fn compressBlockStream(input: *zstd.ZSTD_inBuffer, output: *zstd.ZSTD_outBuffer,
     }
 
     _ = zstd.ZSTD_endStream(cstream, output);
+}
+
+// offtin reads an int64 (little endian) from buf
+fn offtin(buf: []const u8) i64 {
+    var y: u64 = @as(u64, buf[0]);
+    y |= @as(u64, buf[1]) << 8;
+    y |= @as(u64, buf[2]) << 16;
+    y |= @as(u64, buf[3]) << 24;
+    y |= @as(u64, buf[4]) << 32;
+    y |= @as(u64, buf[5]) << 40;
+    y |= @as(u64, buf[6]) << 48;
+    y |= @as(u64, buf[7]) << 56;
+
+    if (y & 0x8000000000000000 != 0) {
+        return -@as(i64, @bitCast(y & 0x7FFFFFFFFFFFFFFF));
+    }
+    return @as(i64, @bitCast(y));
 }
 
 // offtout puts an int64 (little endian) to buf

@@ -23,23 +23,39 @@ try {
 mkdirSync(TEST_DIR, { recursive: true });
 
 console.log("Generating large test files...");
-console.log("This will create ~1MB file to ensure bsdiff takes >30 seconds\n");
+console.log("This will create ~20MB files for performance testing\n");
 
-// Generate an old file (~1MB)
-// We'll create data that compresses reasonably but has some randomness
+// Generate an old file (~20MB)
+// Create more realistic data that simulates an app binary with varied content
 const chunkSize = 1024 * 1024; // 1MB chunks
-const numChunks = 2; // 1MB total
+const numChunks = 20; // 20MB total
 const oldData: Uint8Array[] = [];
+
+// Use a seeded random for reproducibility
+let seed = 12345;
+function seededRandom() {
+  seed = (seed * 1103515245 + 12345) & 0x7fffffff;
+  return seed / 0x7fffffff;
+}
 
 for (let i = 0; i < numChunks; i++) {
   const chunk = new Uint8Array(chunkSize);
-  // Fill with somewhat predictable but not completely repetitive data
   for (let j = 0; j < chunkSize; j++) {
-    // Mix of predictable and random data
-    chunk[j] = (i * 256 + j % 256) & 0xff;
-    // Add some variation every 1KB
-    if (j % 1024 === 0) {
-      chunk[j] = Math.floor(Math.random() * 256);
+    // Create varied content - mix of structured and random data
+    // This simulates real binary files with code, data, strings, etc.
+    const section = Math.floor(j / 4096) % 4;
+    if (section === 0) {
+      // "Code" section - somewhat structured
+      chunk[j] = ((j * 7 + i * 13) % 256);
+    } else if (section === 1) {
+      // "Data" section - more random
+      chunk[j] = Math.floor(seededRandom() * 256);
+    } else if (section === 2) {
+      // "String" section - ASCII-like
+      chunk[j] = 32 + (j % 95);
+    } else {
+      // "Resource" section - repetitive patterns
+      chunk[j] = (j % 64) + (i % 4) * 64;
     }
   }
   oldData.push(chunk);
@@ -48,20 +64,30 @@ for (let i = 0; i < numChunks; i++) {
 await Bun.write(OLD_FILE, Buffer.concat(oldData));
 console.log(`Created old file: ${OLD_FILE} (${numChunks} MB)`);
 
-// Generate new file - similar to old but with changes
+// Generate new file - same structure but with scattered modifications
+// This simulates an app update where some parts changed
+seed = 12345; // Reset seed to match old file's random sections
 const newData: Uint8Array[] = [];
 for (let i = 0; i < numChunks; i++) {
   const chunk = new Uint8Array(chunkSize);
-  // Copy from old with some modifications
   for (let j = 0; j < chunkSize; j++) {
-    chunk[j] = (i * 256 + j % 256) & 0xff;
-    // Different variation pattern
-    if (j % 1024 === 0) {
-      chunk[j] = Math.floor(Math.random() * 256);
+    const section = Math.floor(j / 4096) % 4;
+    if (section === 0) {
+      chunk[j] = ((j * 7 + i * 13) % 256);
+    } else if (section === 1) {
+      chunk[j] = Math.floor(seededRandom() * 256);
+    } else if (section === 2) {
+      chunk[j] = 32 + (j % 95);
+    } else {
+      chunk[j] = (j % 64) + (i % 4) * 64;
     }
-    // Add some changes every 100KB
-    if (j % (100 * 1024) === 0) {
-      chunk[j] = (~chunk[j]) & 0xff;
+
+    // Introduce changes: ~5% of 4KB blocks have modifications
+    const blockNum = Math.floor(j / 4096);
+    const shouldModify = ((blockNum * 31337 + i * 7919) % 20) === 0;
+    if (shouldModify && j % 4096 < 100) {
+      // Modify first 100 bytes of selected blocks
+      chunk[j] = (chunk[j] + 128) & 0xff;
     }
   }
   newData.push(chunk);
