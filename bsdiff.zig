@@ -184,46 +184,6 @@ pub fn calculateDifferences(allocator: *std.mem.Allocator, oldData: []const u8, 
     const saisTimeSec = @as(f64, @floatFromInt(saisTime)) / 1000.0;
     std.debug.print("Suffix array built in {d:.2}s\n", .{saisTimeSec});
 
-    // Build LCP array for accelerated search
-    std.debug.print("Building LCP array...\n", .{});
-    const lcpStart = std.time.milliTimestamp();
-
-    // First compute PLCP (permuted LCP), then convert to LCP
-    const plcp = try allocator.alloc(i64, oldData.len);
-    defer allocator.free(plcp);
-
-    const plcpResult = libsais.zig_libsais64_plcp(
-        oldData.ptr,
-        suffixIndexes.ptr,
-        plcp.ptr,
-        oldDataLen,
-    );
-
-    if (plcpResult != 0) {
-        std.debug.print("libsais64_plcp failed with error code: {d}\n", .{plcpResult});
-        return error.PLCPConstructionFailed;
-    }
-
-    // LCP array: LCP[i] = length of longest common prefix between SA[i-1] and SA[i]
-    const lcpArray = try allocator.alloc(i64, oldData.len);
-    defer allocator.free(lcpArray);
-
-    const lcpResult = libsais.zig_libsais64_lcp(
-        plcp.ptr,
-        suffixIndexes.ptr,
-        lcpArray.ptr,
-        oldDataLen,
-    );
-
-    if (lcpResult != 0) {
-        std.debug.print("libsais64_lcp failed with error code: {d}\n", .{lcpResult});
-        return error.LCPConstructionFailed;
-    }
-
-    const lcpTime = std.time.milliTimestamp() - lcpStart;
-    const lcpTimeSec = @as(f64, @floatFromInt(lcpTime)) / 1000.0;
-    std.debug.print("LCP array built in {d:.2}s\n", .{lcpTimeSec});
-
     // Add sentinel value at the end (used by the original algorithm)
     suffixIndexes[oldData.len] = @intCast(oldData.len);
 
@@ -262,7 +222,6 @@ pub fn calculateDifferences(allocator: *std.mem.Allocator, oldData: []const u8, 
             &chunkResults[i],
             allocator.*,
             suffixIndexes,
-            lcpArray,
             oldData,
             newData,
             chunkStart,
@@ -477,7 +436,6 @@ pub fn calculateDifferences(allocator: *std.mem.Allocator, oldData: []const u8, 
 fn processChunk(
     allocator: std.mem.Allocator,
     suffixIndexes: []i64,
-    lcpArray: []i64,
     oldData: []const u8,
     newData: []const u8,
     chunkStart: usize,
@@ -530,7 +488,7 @@ fn processChunk(
 
         // Search for matches
         while (scanIndex < newsize) {
-            matchLength = @intCast(searchWithLCP(suffixIndexes, lcpArray, oldData, newData[@intCast(scanIndex)..], 0, @intCast(oldsize), &matchPosition));
+            matchLength = @intCast(searchWithLCP(suffixIndexes, oldData, newData[@intCast(scanIndex)..], 0, @intCast(oldsize), &matchPosition));
 
             while (scoreCounter < scanIndex + matchLength) {
                 const currentScanPos = scoreCounter + lastOffset;
@@ -695,13 +653,12 @@ fn processChunkThread(
     result: *ChunkResult,
     allocator: std.mem.Allocator,
     suffixIndexes: []i64,
-    lcpArray: []i64,
     oldData: []const u8,
     newData: []const u8,
     chunkStart: usize,
     nominalEnd: usize,
 ) void {
-    result.* = processChunk(allocator, suffixIndexes, lcpArray, oldData, newData, chunkStart, nominalEnd) catch |err| {
+    result.* = processChunk(allocator, suffixIndexes, oldData, newData, chunkStart, nominalEnd) catch |err| {
         std.debug.print("Chunk processing error: {}\n", .{err});
         return;
     };
@@ -785,10 +742,10 @@ fn offtout(x: i64, buf: []u8) void {
     buf[7] = @intCast((y >> 56) & 0xFF);
 }
 
-/// LCP-accelerated binary search to find the longest match.
-/// By tracking match lengths at boundaries and using the LCP array,
-/// we can skip redundant comparisons, achieving O(m + log n) instead of O(m * log n).
-fn searchWithLCP(suffixIndexes: []i64, _: []i64, oldData: []const u8, newData: []const u8, from: usize, to: usize, bestMatchPosition: *i64) usize {
+/// Boundary-tracking binary search to find the longest match.
+/// By tracking match lengths at boundaries, we skip redundant comparisons,
+/// achieving O(m + log n) instead of O(m * log n).
+fn searchWithLCP(suffixIndexes: []i64, oldData: []const u8, newData: []const u8, from: usize, to: usize, bestMatchPosition: *i64) usize {
     // Use iterative approach with LCP acceleration
     var lo: usize = from;
     var hi: usize = to;
