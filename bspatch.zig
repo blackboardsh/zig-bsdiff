@@ -88,20 +88,28 @@ pub fn main() !void {
     _ = try newFile.writeAll(newfile);
 }
 
+/// Decompression result for parallel decompression
+const DecompressResult = struct {
+    data: []u8,
+    len: usize,
+    err: bool,
+};
+
+/// Thread function for parallel decompression
+fn decompressThread(result: *DecompressResult, buffer: []u8, compressed: []const u8) void {
+    const decompressedLen = zstd.ZSTD_decompress(buffer.ptr, buffer.len, compressed.ptr, compressed.len);
+    if (zstd.ZSTD_isError(decompressedLen) != 0) {
+        result.err = true;
+        result.len = 0;
+    } else {
+        result.err = false;
+        result.len = decompressedLen;
+    }
+    result.data = buffer;
+}
+
 pub fn applyPatch(allocator: *std.mem.Allocator, oldfile: []const u8, patch: []const u8) ![]u8 {
     const header = patch[0..32];
-    var newfile = std.ArrayList(u8).init(allocator.*);
-
-    // Header is
-    //	0	8	"BSDIFF40" or "TRDIFF10" // The only difference in file format is bzip2 vs zstd compression of the blocks
-    //	8	8	length of ctrl block  i64
-    //	16	8	length of diff block  i64
-    //	24	8	length of extra block i64
-    // File is
-    //  0	32	Header
-    //  32	??	ctrl block  uncompresses to i64
-    //  ??	??	diff block  uncompresses to i8
-    //  ??	??	extra block uncompresses to u8
 
     // Check for appropriate magic
     if (std.mem.eql(u8, header[0..8], "TRDIFF10") == false) {
@@ -122,44 +130,50 @@ pub fn applyPatch(allocator: *std.mem.Allocator, oldfile: []const u8, patch: []c
         return error.CorruptPatch;
     }
 
-    const controlBlockCompressed = patch[controlStart..@intCast(diffStart)];
-    // The size of the decoded block is going to be <= the size of the new file.
-    var controlBlockBuffer = try allocator.alloc(u8, @intCast(newSize));
-    // const controlBlockDecodedLen = try std.compress.zstd.decompress.decode(controlBlockDecoded, patch[controlStart..@intCast(diffStart)], false);
-    const controlBlockDecodedLength: usize = zstd.ZSTD_decompress(controlBlockBuffer.ptr, controlBlockBuffer.len, controlBlockCompressed.ptr, controlBlockCompressed.len);
-    if (zstd.ZSTD_isError(controlBlockDecodedLength) != 0) {
-        // Handle the error. ZSTD_getErrorName can provide a string describing the error
-        const errorMsg = zstd.ZSTD_getErrorName(controlBlockDecodedLength);
-        std.debug.print("Decompression error: {s}\n", .{errorMsg});
-        std.process.exit(1);
-    }
-    const controlBlock = controlBlockBuffer[0..controlBlockDecodedLength];
+    const newSizeUsize: usize = @intCast(newSize);
 
-    // diffblock
-    const diffBlockCompressed = patch[diffStart..@intCast(extraStart)];
-    // The size of the decoded block is going to be <= the size of the new file.
-    var diffBlockBuffer = try allocator.alloc(u8, @intCast(newSize));
-    const diffBlockDecodedLength: usize = zstd.ZSTD_decompress(diffBlockBuffer.ptr, diffBlockBuffer.len, diffBlockCompressed.ptr, diffBlockCompressed.len);
-    if (zstd.ZSTD_isError(diffBlockDecodedLength) != 0) {
-        // Handle the error. ZSTD_getErrorName can provide a string describing the error
-        const errorMsg = zstd.ZSTD_getErrorName(diffBlockDecodedLength);
-        std.debug.print("Decompression error: {s}\n", .{errorMsg});
-        std.process.exit(1);
-    }
-    const diffBlock = diffBlockBuffer[0..diffBlockDecodedLength];
+    // Pre-allocate the output buffer (key optimization: no ArrayList resizing)
+    var newfile = try allocator.alloc(u8, newSizeUsize);
 
-    // extrablock
-    const extraBlockCompressed = patch[extraStart..];
-    // The size of the decoded block is going to be <= the size of the new file.
-    var extraBlockBuffer = try allocator.alloc(u8, @intCast(newSize));
-    const extraBlockDecodedLength: usize = zstd.ZSTD_decompress(extraBlockBuffer.ptr, extraBlockBuffer.len, extraBlockCompressed.ptr, extraBlockCompressed.len);
-    if (zstd.ZSTD_isError(extraBlockDecodedLength) != 0) {
-        // Handle the error. ZSTD_getErrorName can provide a string describing the error
-        const errorMsg = zstd.ZSTD_getErrorName(extraBlockDecodedLength);
-        std.debug.print("Decompression error: {s}\n", .{errorMsg});
-        std.process.exit(1);
+    // Allocate decompression buffers
+    var controlBlockBuffer = try allocator.alloc(u8, newSizeUsize);
+    var diffBlockBuffer = try allocator.alloc(u8, newSizeUsize);
+    var extraBlockBuffer = try allocator.alloc(u8, newSizeUsize);
+
+    // Parallel decompression of all three blocks
+    var controlResult = DecompressResult{ .data = undefined, .len = 0, .err = false };
+    var diffResult = DecompressResult{ .data = undefined, .len = 0, .err = false };
+    var extraResult = DecompressResult{ .data = undefined, .len = 0, .err = false };
+
+    const controlThread = try std.Thread.spawn(.{}, decompressThread, .{
+        &controlResult,
+        controlBlockBuffer,
+        patch[controlStart..diffStart],
+    });
+    const diffThread = try std.Thread.spawn(.{}, decompressThread, .{
+        &diffResult,
+        diffBlockBuffer,
+        patch[diffStart..extraStart],
+    });
+    const extraThread = try std.Thread.spawn(.{}, decompressThread, .{
+        &extraResult,
+        extraBlockBuffer,
+        patch[extraStart..],
+    });
+
+    // Wait for all decompressions to complete
+    controlThread.join();
+    diffThread.join();
+    extraThread.join();
+
+    if (controlResult.err or diffResult.err or extraResult.err) {
+        std.debug.print("Decompression error\n", .{});
+        return error.DecompressionFailed;
     }
-    const extraBlock = extraBlockBuffer[0..extraBlockDecodedLength];
+
+    const controlBlock = controlBlockBuffer[0..controlResult.len];
+    const diffBlock = diffBlockBuffer[0..diffResult.len];
+    const extraBlock = extraBlockBuffer[0..extraResult.len];
 
     var controlpos: usize = 0;
     var diffpos: usize = 0;
@@ -167,98 +181,54 @@ pub fn applyPatch(allocator: *std.mem.Allocator, oldfile: []const u8, patch: []c
     var oldpos: usize = 0;
     var newpos: usize = 0;
 
-    // Start progress logging thread
-    var progressRunning: bool = true;
-    var progressPercent: f32 = 0.0;
-    var progressBytes: usize = 0;
-    const totalBytes: usize = @intCast(newSize);
-    const progressThread = try std.Thread.spawn(.{}, logProgressBytes, .{ &progressRunning, &progressPercent, &progressBytes, totalBytes, "Patching" });
-
-    while (controlpos < controlBlockDecodedLength) {
-        // Update progress for logging thread
-        progressBytes = newpos;
-        progressPercent = (@as(f32, @floatFromInt(newpos)) / @as(f32, @floatFromInt(newSize))) * 100.0;
+    // Main patching loop - optimized with direct memory writes
+    while (controlpos < controlResult.len) {
         // Read control data
         const readDiffBy: usize = @intCast(offtin(controlBlock[controlpos .. controlpos + 8]));
         controlpos += 8;
         const readExtraBy: usize = @intCast(offtin(controlBlock[controlpos .. controlpos + 8]));
         controlpos += 8;
-        // Note: this can be negative, since we may seek backwards in the old file to use different data
-        // for different parts of the file.
         const seekBy: i64 = offtin(controlBlock[controlpos .. controlpos + 8]);
         controlpos += 8;
 
-        // Setup the diff slices
+        // Apply diff block: newfile[newpos..] = oldfile[oldpos..] + diffBlock[diffpos..]
         const diffSlice = diffBlock[diffpos .. diffpos + readDiffBy];
-        diffpos += readDiffBy;
         const oldSlice = oldfile[oldpos .. oldpos + readDiffBy];
+        const newSlice = newfile[newpos .. newpos + readDiffBy];
 
+        // SIMD-accelerated diff application with direct memory writes
         var i: usize = 0;
+        while (i + vectorSize <= readDiffBy) {
+            const oldVec: @Vector(vectorSize, u8) = oldSlice[i..][0..vectorSize].*;
+            const diffVec: @Vector(vectorSize, u8) = diffSlice[i..][0..vectorSize].*;
+            const resultVec = @addWithOverflow(oldVec, diffVec)[0];
+            newSlice[i..][0..vectorSize].* = resultVec;
+            i += vectorSize;
+        }
 
-        while (i < diffSlice.len) {
-            // Note: the overhead of padding the last vector actually makes it slower than
-            // letting it iterate (tested on machine with vector size of 16)
-            if (i + vectorSize <= diffSlice.len) {
-                const oldVec: @Vector(vectorSize, u8) = oldSlice[i..][0..vectorSize].*;
-                const diffVec: @Vector(vectorSize, u8) = diffSlice[i..][0..vectorSize].*;
-                const resultVec = @addWithOverflow(oldVec, diffVec)[0];
-                const resultArray: [vectorSize]u8 = resultVec;
-                try newfile.appendSlice(&resultArray);
-                i += vectorSize;
-                continue;
-            }
-
-            // Vector overhead here requires vector size of 4 or greater to get any benefit
-            // less than 4 actually slows it down.
-            const vectorSize4 = 4;
-
-            if (i + vectorSize4 <= diffSlice.len) {
-                const oldVec: @Vector(vectorSize4, u8) = oldSlice[i..][0..vectorSize4].*;
-                const diffVec: @Vector(vectorSize4, u8) = diffSlice[i..][0..vectorSize4].*;
-                const resultVec = @addWithOverflow(oldVec, diffVec)[0];
-                const resultArray: [vectorSize4]u8 = resultVec;
-                try newfile.appendSlice(&resultArray);
-                i += vectorSize4;
-                continue;
-            }
-
-            // Note: The diff block can contain the difference between the byte in the old and new fle,
-            // modulo 256. Technically you can just do oldByte + diffByte and it'll operate modulo 256
-            // as well, and get the right result.
-            // Running zig in release mode it'll ignore the integer overflow but in dev mode the "warning"
-            // exits the program. Zig likes it when you declare your intention explicitely.
-            // More lines of code, but also anyone looking at this can immediately see what's going on.
-            // no hidden bullshit; which is nice. And I'm guessing the optimizer could generally use
-            // more explicit code to optimize better. Had the c or go reference implementations had this,
-            // it would have saved me time hunting down an obscure bug generating corrupt patches, and I
-            // wouldn't have had to write such a long comment to get closure on how I spent the last 2 hours.
-            const oldByte = oldSlice[i];
-            const diffByte = diffSlice[i];
-            const newByte: u8 = @addWithOverflow(diffByte, oldByte)[0];
-
-            try newfile.append(newByte);
+        // Handle remaining bytes
+        while (i < readDiffBy) {
+            newSlice[i] = @addWithOverflow(oldSlice[i], diffSlice[i])[0];
             i += 1;
         }
 
-        const to = extrapos + readExtraBy;
-        try newfile.appendSlice(extraBlock[extrapos..to]);
+        diffpos += readDiffBy;
+        newpos += readDiffBy;
 
-        extrapos += readExtraBy;
+        // Copy extra block directly (no arithmetic needed)
+        if (readExtraBy > 0) {
+            @memcpy(newfile[newpos .. newpos + readExtraBy], extraBlock[extrapos .. extrapos + readExtraBy]);
+            extrapos += readExtraBy;
+            newpos += readExtraBy;
+        }
 
         oldpos = @intCast(@as(i64, @intCast(oldpos + readDiffBy)) + seekBy);
-        newpos += readDiffBy + readExtraBy;
     }
 
-    // Stop progress logging
-    progressBytes = totalBytes;
-    progressPercent = 100.0;
-    progressRunning = false;
-    progressThread.join();
-
-    const newSizeMB = @as(f64, @floatFromInt(newfile.items.len)) / (1024.0 * 1024.0);
+    const newSizeMB = @as(f64, @floatFromInt(newfile.len)) / (1024.0 * 1024.0);
     std.debug.print("Completed - New file: {d:.2} MB\n", .{newSizeMB});
 
-    return newfile.items;
+    return newfile;
 }
 
 // offtin reads an int64 (little endian)
