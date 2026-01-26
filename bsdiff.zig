@@ -197,9 +197,7 @@ pub fn calculateDifferences(allocator: *std.mem.Allocator, oldData: []const u8, 
     // Use at most 8 threads, at least 1, and ensure chunks are at least 1MB
     const minChunkSize: usize = 1024 * 1024; // 1MB minimum
     const maxThreads = @min(cpuCount, 8);
-    // Set to true for parallel processing, false for single-threaded
-    const useParallel = true;
-    const numChunks = if (useParallel) @max(1, @min(maxThreads, newsize / minChunkSize)) else 1;
+    const numChunks = @max(1, @min(maxThreads, newsize / minChunkSize));
 
     std.debug.print("Parallel diff with {d} chunks on {d} CPUs...\n", .{ numChunks, cpuCount });
 
@@ -209,6 +207,9 @@ pub fn calculateDifferences(allocator: *std.mem.Allocator, oldData: []const u8, 
     // Allocate results array and threads array
     var chunkResults = try allocator.alloc(ChunkResult, numChunks);
     defer allocator.free(chunkResults);
+
+    // Track completed chunks for progress reporting
+    var completedChunks: usize = 0;
 
     var threads = try allocator.alloc(std.Thread, numChunks);
     defer allocator.free(threads);
@@ -226,13 +227,28 @@ pub fn calculateDifferences(allocator: *std.mem.Allocator, oldData: []const u8, 
             newData,
             chunkStart,
             nominalEnd,
+            &completedChunks,
         });
     }
 
-    // Wait for all threads to complete
+    // Start a progress reporting thread
+    var progressRunning: bool = true;
+    const progressStart = std.time.milliTimestamp();
+    const progressThread = try std.Thread.spawn(.{}, reportDiffProgress, .{
+        &progressRunning,
+        &completedChunks,
+        numChunks,
+        progressStart,
+    });
+
+    // Wait for all chunk threads to complete
     for (threads) |thread| {
         thread.join();
     }
+
+    // Stop the progress thread
+    @atomicStore(bool, &progressRunning, false, .seq_cst);
+    progressThread.join();
 
     // Report diff phase timing
     const diffPhaseTime = std.time.milliTimestamp() - diffPhaseStart;
@@ -313,22 +329,27 @@ pub fn calculateDifferences(allocator: *std.mem.Allocator, oldData: []const u8, 
     var extraBlockStream = try allocator.alloc(u8, @max(totalExtraLen, 1024));
 
     // Copy data from chunks, skipping overlaps
+    // Track the oldpos at the end of the previous chunk to adjust seekBy for chunk boundaries
     var controlOffset: usize = 0;
     var diffOffset: usize = 0;
     var extraOffset: usize = 0;
+    var prevChunkEndOldpos: i64 = 0; // Where oldpos ends after each chunk (after adjustment)
 
     for (0..numChunks) |i| {
         const skipControlBytes = chunkDataStarts[i];
 
-        // Calculate corresponding diff/extra skip amounts by parsing skipped control blocks
+        // Calculate corresponding diff/extra skip amounts AND the oldpos delta of skipped blocks
         var skipDiffBytes: usize = 0;
         var skipExtraBytes: usize = 0;
+        var skippedOldposDelta: i64 = 0;
         var ctrlPos: usize = 0;
         while (ctrlPos < skipControlBytes) {
             const forwardLen = offtin(chunkResults[i].controlData[ctrlPos..][0..8]);
             const extraLen = offtin(chunkResults[i].controlData[ctrlPos + 8 ..][0..16][0..8]);
+            const seekBySkipped = offtin(chunkResults[i].controlData[ctrlPos + 16 ..][0..8]);
             skipDiffBytes += @intCast(forwardLen);
             skipExtraBytes += @intCast(extraLen);
+            skippedOldposDelta += forwardLen + seekBySkipped;
             ctrlPos += 24;
         }
 
@@ -337,7 +358,39 @@ pub fn calculateDifferences(allocator: *std.mem.Allocator, oldData: []const u8, 
         const extraToCopy = chunkResults[i].extraLen - skipExtraBytes;
 
         if (controlToCopy > 0) {
+            // Calculate the delta for the remaining (non-skipped) control blocks
+            var remainingDelta: i64 = 0;
+            var pos: usize = skipControlBytes;
+            while (pos < chunkResults[i].controlLen) {
+                const readDiffBy = offtin(chunkResults[i].controlData[pos..][0..8]);
+                const seekBy = offtin(chunkResults[i].controlData[pos + 16 ..][0..8]);
+                remainingDelta += readDiffBy + seekBy;
+                pos += 24;
+            }
+
+            // Copy control data
             @memcpy(controlBlockStream[controlOffset..][0..controlToCopy], chunkResults[i].controlData[skipControlBytes..][0..controlToCopy]);
+
+            // For chunks after the first, adjust the first control block's seekBy
+            // The first remaining block's seekBy was calculated assuming we're at the end
+            // of the skipped blocks (skippedOldposDelta). But we're actually at prevChunkEndOldpos.
+            if (i > 0 and controlToCopy >= 24) {
+                // Read the current seekBy (third i64 in control block)
+                const currentSeekBy = offtin(controlBlockStream[controlOffset + 16 ..][0..8]);
+                // The first remaining block expects oldpos = skippedOldposDelta
+                // We're actually at oldpos = prevChunkEndOldpos
+                // Adjust: new_seekBy = currentSeekBy + skippedOldposDelta - prevChunkEndOldpos
+                const adjustedSeekBy = currentSeekBy + skippedOldposDelta - prevChunkEndOldpos;
+                // Write back the adjusted value
+                offtout(adjustedSeekBy, controlBlockStream[controlOffset + 16 ..][0..8]);
+            }
+
+            // After applying this chunk's remaining blocks (with adjustment),
+            // oldpos ends at: skippedOldposDelta + remainingDelta
+            // But we adjusted so that we start from prevChunkEndOldpos instead of 0,
+            // so the actual ending oldpos is: remainingDelta + skippedOldposDelta
+            prevChunkEndOldpos = skippedOldposDelta + remainingDelta;
+
             controlOffset += controlToCopy;
         }
 
@@ -648,6 +701,35 @@ fn processChunk(
     };
 }
 
+/// Progress reporting thread for parallel diff
+fn reportDiffProgress(
+    running: *bool,
+    completedChunks: *usize,
+    numChunks: usize,
+    startTime: i64,
+) void {
+    var lastPrintTime: i64 = startTime;
+
+    while (@atomicLoad(bool, running, .seq_cst)) {
+        std.time.sleep(std.time.ns_per_s * 1); // Check every second
+
+        const now = std.time.milliTimestamp();
+        const elapsed = now - startTime;
+        const elapsedSec = @as(f64, @floatFromInt(elapsed)) / 1000.0;
+        const timeSinceLastPrint = now - lastPrintTime;
+
+        // Print every 10 seconds if still running
+        if (timeSinceLastPrint >= 10000) {
+            const completed = @atomicLoad(usize, completedChunks, .seq_cst);
+            if (completed < numChunks) {
+                const percent = (@as(f64, @floatFromInt(completed)) / @as(f64, @floatFromInt(numChunks))) * 100.0;
+                std.debug.print("Diffing... {d}/{d} chunks complete ({d:.0}%) - {d:.0}s elapsed\n", .{ completed, numChunks, percent, elapsedSec });
+                lastPrintTime = now;
+            }
+        }
+    }
+}
+
 /// Thread wrapper for processChunk
 fn processChunkThread(
     result: *ChunkResult,
@@ -657,11 +739,14 @@ fn processChunkThread(
     newData: []const u8,
     chunkStart: usize,
     nominalEnd: usize,
+    completedChunks: *usize,
 ) void {
     result.* = processChunk(allocator, suffixIndexes, oldData, newData, chunkStart, nominalEnd) catch |err| {
         std.debug.print("Chunk processing error: {}\n", .{err});
+        _ = @atomicRmw(usize, completedChunks, .Add, 1, .seq_cst);
         return;
     };
+    _ = @atomicRmw(usize, completedChunks, .Add, 1, .seq_cst);
 }
 
 var totalCompressedSize: usize = 0;
