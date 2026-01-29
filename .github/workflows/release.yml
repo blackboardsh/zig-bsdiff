@@ -50,7 +50,11 @@ jobs:
         with:
           node-version: '18'
 
-      - name: Setup MinGW on Windows
+      - name: Setup MSVC on Windows
+        if: matrix.platform == 'win32'
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Setup MinGW on Windows (for libsais compilation)
         if: matrix.platform == 'win32'
         run: |
           choco install mingw -y
@@ -62,11 +66,11 @@ jobs:
 
       - name: Build binaries
         run: |
-          zig build -Doptimize=ReleaseFast
+          zig build -Doptimize=ReleaseFast ${{ matrix.platform == 'win32' && '-Dtarget=x86_64-windows-msvc' || '' }}
 
       - name: Test
         run: |
-          zig build test
+          zig build test ${{ matrix.platform == 'win32' && '-Dtarget=x86_64-windows-msvc' || '' }}
 
       - name: Package binaries
         run: |
