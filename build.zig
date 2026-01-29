@@ -83,6 +83,11 @@ pub fn build(b: *std.Build) void {
 
     b.installArtifact(bspatch);
 
+    // Separate step to build only bspatch (used on Windows CI to rebuild with MSVC ABI
+    // without triggering bsdiff's libsais link which requires MinGW)
+    const bspatch_only = b.step("bspatch-only", "Build only bspatch");
+    bspatch_only.dependOn(&b.addInstallArtifact(bspatch, .{}).step);
+
     const tests = b.addTest(.{
         .root_source_file = b.path("tests.zig"),
         .target = target,

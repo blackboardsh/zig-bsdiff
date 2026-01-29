@@ -66,11 +66,16 @@ jobs:
 
       - name: Build binaries
         run: |
-          zig build -Doptimize=ReleaseFast ${{ matrix.platform == 'win32' && '-Dtarget=x86_64-windows-msvc' || '' }}
+          zig build -Doptimize=ReleaseFast
+
+      - name: Rebuild bspatch with MSVC ABI (Windows)
+        if: matrix.platform == 'win32'
+        run: |
+          zig build bspatch-only -Doptimize=ReleaseFast -Dtarget=x86_64-windows-msvc
 
       - name: Test
         run: |
-          zig build test ${{ matrix.platform == 'win32' && '-Dtarget=x86_64-windows-msvc' || '' }}
+          zig build test
 
       - name: Package binaries
         run: |
