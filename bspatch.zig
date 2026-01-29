@@ -73,13 +73,6 @@ pub fn main() !void {
     defer allocator.free(patchFileBuff);
     _ = try patchFile.readAll(patchFileBuff);
 
-    // Log SIMD capabilities    
-    std.debug.print("SIMD Status:\n", .{});
-    std.debug.print("  Vector size: {d} bytes\n", .{vectorSize});
-    std.debug.print("  Platform: {s}\n", .{@tagName(builtin.target.cpu.arch)});
-    std.debug.print("  SIMD support: {s}\n", .{if (vectorSize > 1) "enabled" else "disabled (fallback to scalar)"});
-    std.debug.print("\n", .{});
-
     const newfile = try applyPatch(&allocator, oldFileBuff, patchFileBuff);
 
     const newFile = try std.fs.cwd().createFile(newFilePath, .{});
@@ -96,9 +89,11 @@ const DecompressResult = struct {
 };
 
 /// Thread function for parallel decompression
-fn decompressThread(result: *DecompressResult, buffer: []u8, compressed: []const u8) void {
+fn decompressThread(result: *DecompressResult, buffer: []u8, compressed: []const u8, blockName: []const u8) void {
     const decompressedLen = zstd.ZSTD_decompress(buffer.ptr, buffer.len, compressed.ptr, compressed.len);
     if (zstd.ZSTD_isError(decompressedLen) != 0) {
+        const errName = zstd.ZSTD_getErrorName(decompressedLen);
+        std.debug.print("Decompression error ({s}): {s} (compressed={d}, buffer={d})\n", .{ blockName, errName, compressed.len, buffer.len });
         result.err = true;
         result.len = 0;
     } else {
@@ -122,11 +117,18 @@ pub fn applyPatch(allocator: *std.mem.Allocator, oldfile: []const u8, patch: []c
     const diffLen = offtin(header[16..24]);
     const newSize = offtin(header[24..32]);
 
+    if (controlLen < 0 or diffLen < 0 or newSize < 0) {
+        std.debug.print("Patch error: Negative length in header\n", .{});
+        return error.CorruptPatch;
+    }
+
     const controlStart: usize = 32;
     const diffStart: usize = controlStart + @as(usize, @intCast(controlLen));
     const extraStart: usize = diffStart + @as(usize, @intCast(diffLen));
 
-    if (controlLen < 0 or diffLen < 0 or newSize < 0) {
+    // Validate that offsets don't exceed patch size
+    if (diffStart > patch.len or extraStart > patch.len) {
+        std.debug.print("Patch error: Header lengths exceed patch file size\n", .{});
         return error.CorruptPatch;
     }
 
@@ -135,30 +137,70 @@ pub fn applyPatch(allocator: *std.mem.Allocator, oldfile: []const u8, patch: []c
     // Pre-allocate the output buffer (key optimization: no ArrayList resizing)
     var newfile = try allocator.alloc(u8, newSizeUsize);
 
-    // Allocate decompression buffers
-    var controlBlockBuffer = try allocator.alloc(u8, newSizeUsize);
-    var diffBlockBuffer = try allocator.alloc(u8, newSizeUsize);
-    var extraBlockBuffer = try allocator.alloc(u8, newSizeUsize);
+    // Get the actual decompressed sizes from the zstd frame headers
+    // This is more reliable than guessing based on newSizeUsize
+    const controlCompressed = patch[controlStart..diffStart];
+    const diffCompressed = patch[diffStart..extraStart];
+    const extraCompressed = patch[extraStart..];
+
+    const controlDecompSize = zstd.ZSTD_getFrameContentSize(controlCompressed.ptr, controlCompressed.len);
+    const diffDecompSize = zstd.ZSTD_getFrameContentSize(diffCompressed.ptr, diffCompressed.len);
+    const extraDecompSize = zstd.ZSTD_getFrameContentSize(extraCompressed.ptr, extraCompressed.len);
+
+    // Check for errors in getting frame sizes
+    const ZSTD_CONTENTSIZE_UNKNOWN: c_ulonglong = @bitCast(@as(i64, -1));
+    const ZSTD_CONTENTSIZE_ERROR: c_ulonglong = @bitCast(@as(i64, -2));
+
+    if (controlDecompSize == ZSTD_CONTENTSIZE_ERROR or diffDecompSize == ZSTD_CONTENTSIZE_ERROR or extraDecompSize == ZSTD_CONTENTSIZE_ERROR) {
+        std.debug.print("Error: Invalid zstd frame in patch file\n", .{});
+        // Check first few bytes of each block to see if they look like valid zstd frames
+        if (controlCompressed.len >= 4) {
+            std.debug.print("  Control block first 4 bytes: {x:0>2} {x:0>2} {x:0>2} {x:0>2}\n", .{ controlCompressed[0], controlCompressed[1], controlCompressed[2], controlCompressed[3] });
+        }
+        if (diffCompressed.len >= 4) {
+            std.debug.print("  Diff block first 4 bytes: {x:0>2} {x:0>2} {x:0>2} {x:0>2}\n", .{ diffCompressed[0], diffCompressed[1], diffCompressed[2], diffCompressed[3] });
+        }
+        if (extraCompressed.len >= 4) {
+            std.debug.print("  Extra block first 4 bytes: {x:0>2} {x:0>2} {x:0>2} {x:0>2}\n", .{ extraCompressed[0], extraCompressed[1], extraCompressed[2], extraCompressed[3] });
+        }
+        return error.InvalidPatchFormat;
+    }
+
+    // If size is unknown, fall back to a generous estimate
+    // Note: diff block can be larger than newSize if there's significant overlap in the diff regions
+    // Use oldfile.len + newSizeUsize as upper bound for diff block (theoretical maximum)
+    const controlBufSize: usize = if (controlDecompSize == ZSTD_CONTENTSIZE_UNKNOWN) newSizeUsize * 2 else @intCast(controlDecompSize);
+    const diffBufSize: usize = if (diffDecompSize == ZSTD_CONTENTSIZE_UNKNOWN) oldfile.len + newSizeUsize else @intCast(diffDecompSize);
+    const extraBufSize: usize = if (extraDecompSize == ZSTD_CONTENTSIZE_UNKNOWN) newSizeUsize else @intCast(extraDecompSize);
+
+    // Allocate decompression buffers with correct sizes
+    var controlBlockBuffer = try allocator.alloc(u8, controlBufSize);
+    var diffBlockBuffer = try allocator.alloc(u8, diffBufSize);
+    var extraBlockBuffer = try allocator.alloc(u8, extraBufSize);
 
     // Parallel decompression of all three blocks
     var controlResult = DecompressResult{ .data = undefined, .len = 0, .err = false };
     var diffResult = DecompressResult{ .data = undefined, .len = 0, .err = false };
     var extraResult = DecompressResult{ .data = undefined, .len = 0, .err = false };
 
+    // Parallel decompression of all three blocks
     const controlThread = try std.Thread.spawn(.{}, decompressThread, .{
         &controlResult,
         controlBlockBuffer,
         patch[controlStart..diffStart],
+        "Control",
     });
     const diffThread = try std.Thread.spawn(.{}, decompressThread, .{
         &diffResult,
         diffBlockBuffer,
         patch[diffStart..extraStart],
+        "Diff",
     });
     const extraThread = try std.Thread.spawn(.{}, decompressThread, .{
         &extraResult,
         extraBlockBuffer,
         patch[extraStart..],
+        "Extra",
     });
 
     // Wait for all decompressions to complete
@@ -180,9 +222,11 @@ pub fn applyPatch(allocator: *std.mem.Allocator, oldfile: []const u8, patch: []c
     var extrapos: usize = 0;
     var oldpos: usize = 0;
     var newpos: usize = 0;
+    var entryNum: usize = 0;
 
     // Main patching loop - optimized with direct memory writes
     while (controlpos < controlResult.len) {
+        entryNum += 1;
         // Read control data
         const readDiffBy: usize = @intCast(offtin(controlBlock[controlpos .. controlpos + 8]));
         controlpos += 8;
@@ -190,6 +234,17 @@ pub fn applyPatch(allocator: *std.mem.Allocator, oldfile: []const u8, patch: []c
         controlpos += 8;
         const seekBy: i64 = offtin(controlBlock[controlpos .. controlpos + 8]);
         controlpos += 8;
+
+        // Validate bounds before writing
+        if (newpos + readDiffBy > newfile.len) {
+            std.debug.print("Patch error: entry {d} would write past end of file (newpos={d} + diffBy={d} > size={d})\n", .{ entryNum, newpos, readDiffBy, newfile.len });
+            std.debug.print("  readExtraBy={d}, seekBy={d}, controlpos={d}/{d}\n", .{ readExtraBy, seekBy, controlpos, controlResult.len });
+            return error.PatchCorrupt;
+        }
+        if (diffpos + readDiffBy > diffResult.len) {
+            std.debug.print("Patch error: control data reads past end of diff block\n", .{});
+            return error.PatchCorrupt;
+        }
 
         // Apply diff block: newfile[newpos..] = oldfile[oldpos..] + diffBlock[diffpos..]
         const diffSlice = diffBlock[diffpos .. diffpos + readDiffBy];

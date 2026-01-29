@@ -256,151 +256,233 @@ pub fn calculateDifferences(allocator: *std.mem.Allocator, oldData: []const u8, 
     std.debug.print("Diff phase: {d:.2}s (parallel)\n", .{diffPhaseSec});
 
     // Merge chunk results, handling overlaps
-    // If chunk N extended past its boundary into chunk N+1's territory,
-    // we need to discard the overlapping portion from chunk N+1
+    // Strategy: Skip all entries from chunk N+1 that overlap with chunk N's actual end.
+    // If there's a gap (chunk N+1's first kept entry starts after chunk N's end),
+    // fill it with extra data copied directly from newData.
 
-    // First, calculate total sizes needed
+    // First pass: calculate skip offsets and gaps for each chunk
+    const ChunkMergeInfo = struct {
+        controlSkip: usize, // bytes to skip in control data
+        diffSkip: usize, // bytes to skip in diff data
+        extraSkip: usize, // bytes to skip in extra data
+        gapStart: usize, // where the gap starts in newData (= prevActualEnd)
+        gapEnd: usize, // where the gap ends (= first kept entry's start position)
+        firstKeptEntryStart: usize, // newData position where first kept entry starts
+    };
+
+    var chunkMergeInfo = try allocator.alloc(ChunkMergeInfo, numChunks);
+    defer allocator.free(chunkMergeInfo);
+
     var totalControlLen: usize = 0;
     var totalDiffLen: usize = 0;
     var totalExtraLen: usize = 0;
+    var totalGapBytes: usize = 0;
 
-    // Track where each chunk's data actually starts (after discarding overlaps)
-    var chunkDataStarts = try allocator.alloc(usize, numChunks);
-    defer allocator.free(chunkDataStarts);
+    // Track the maximum coverage seen so far (not just previous chunk's end)
+    // This is critical because chunk N might extend further than chunk N+1
+    var maxActualEndSoFar: usize = 0;
 
     for (0..numChunks) |i| {
-        var startOffset: usize = 0;
-
-        // Check if previous chunk extended into this chunk's territory
-        if (i > 0) {
-            const prevActualEnd = chunkResults[i - 1].actualEndPos;
+        if (i == 0) {
+            // First chunk: no overlap possible
+            chunkMergeInfo[i] = .{
+                .controlSkip = 0,
+                .diffSkip = 0,
+                .extraSkip = 0,
+                .gapStart = 0,
+                .gapEnd = 0,
+                .firstKeptEntryStart = chunkResults[i].startPos,
+            };
+            totalControlLen += chunkResults[i].controlLen;
+            totalDiffLen += chunkResults[i].diffLen;
+            totalExtraLen += chunkResults[i].extraLen;
+            maxActualEndSoFar = chunkResults[i].actualEndPos;
+        } else {
+            // Use the maximum coverage seen so far, not just the previous chunk's end
+            // This handles cases where chunk N extends further than chunks N+1, N+2, etc.
+            const prevActualEnd = maxActualEndSoFar;
             const thisStart = chunkResults[i].startPos;
 
-            if (prevActualEnd > thisStart) {
-                // Previous chunk extended into our territory
-                // We need to skip control blocks until we're past the overlap
-                // Each control block covers some portion of newData
-                // We need to figure out how many bytes of newData our control blocks cover
-                // and skip until we're past prevActualEnd
 
+            if (prevActualEnd <= thisStart) {
+                // No overlap - but there might be a gap
+                chunkMergeInfo[i] = .{
+                    .controlSkip = 0,
+                    .diffSkip = 0,
+                    .extraSkip = 0,
+                    .gapStart = prevActualEnd,
+                    .gapEnd = thisStart,
+                    .firstKeptEntryStart = thisStart,
+                };
+                const gapSize = thisStart - prevActualEnd;
+                totalGapBytes += gapSize;
+                totalControlLen += chunkResults[i].controlLen;
+                totalDiffLen += chunkResults[i].diffLen;
+                totalExtraLen += chunkResults[i].extraLen;
+            } else {
+                // Overlap: skip entries until we're past prevActualEnd
                 var newDataCovered: usize = thisStart;
                 var controlOffset: usize = 0;
                 var diffOffset: usize = 0;
                 var extraOffset: usize = 0;
 
-                while (controlOffset < chunkResults[i].controlLen and newDataCovered < prevActualEnd) {
-                    // Read the control block
+                while (controlOffset < chunkResults[i].controlLen) {
                     const forwardLen = offtin(chunkResults[i].controlData[controlOffset..][0..8]);
                     const extraLen = offtin(chunkResults[i].controlData[controlOffset + 8 ..][0..16][0..8]);
+                    const entryEnd = newDataCovered + @as(usize, @intCast(forwardLen + extraLen));
 
-                    // This control block covers forwardLen + extraLen bytes of newData
-                    newDataCovered += @intCast(forwardLen + extraLen);
-
-                    controlOffset += 24;
-                    diffOffset += @intCast(forwardLen);
-                    extraOffset += @intCast(extraLen);
+                    if (entryEnd <= prevActualEnd) {
+                        // Entry fully within overlap - skip it
+                        newDataCovered = entryEnd;
+                        controlOffset += 24;
+                        diffOffset += @intCast(forwardLen);
+                        extraOffset += @intCast(extraLen);
+                    } else if (newDataCovered >= prevActualEnd) {
+                        // Entry starts at or after overlap - keep it
+                        break;
+                    } else {
+                        // Entry crosses the boundary - skip it entirely
+                        // The gap will be filled with extra data
+                        newDataCovered = entryEnd;
+                        controlOffset += 24;
+                        diffOffset += @intCast(forwardLen);
+                        extraOffset += @intCast(extraLen);
+                    }
                 }
 
-                startOffset = controlOffset;
-                // Store the offsets we need to skip
-                chunkDataStarts[i] = startOffset;
+                // Calculate gap: from prevActualEnd to where we are now
+                const gapSize = if (newDataCovered > prevActualEnd) newDataCovered - prevActualEnd else 0;
 
-                // Adjust the lengths to account for skipped data
+                chunkMergeInfo[i] = .{
+                    .controlSkip = controlOffset,
+                    .diffSkip = diffOffset,
+                    .extraSkip = extraOffset,
+                    .gapStart = prevActualEnd,
+                    .gapEnd = newDataCovered,
+                    .firstKeptEntryStart = newDataCovered,
+                };
+
+                totalGapBytes += gapSize;
                 totalControlLen += chunkResults[i].controlLen - controlOffset;
                 totalDiffLen += chunkResults[i].diffLen - diffOffset;
                 totalExtraLen += chunkResults[i].extraLen - extraOffset;
-            } else {
-                chunkDataStarts[i] = 0;
-                totalControlLen += chunkResults[i].controlLen;
-                totalDiffLen += chunkResults[i].diffLen;
-                totalExtraLen += chunkResults[i].extraLen;
             }
-        } else {
-            chunkDataStarts[i] = 0;
-            totalControlLen += chunkResults[i].controlLen;
-            totalDiffLen += chunkResults[i].diffLen;
-            totalExtraLen += chunkResults[i].extraLen;
+
+            // Update max coverage tracking
+            maxActualEndSoFar = @max(maxActualEndSoFar, chunkResults[i].actualEndPos);
         }
     }
+
+    // Account for gap fill entries: each gap needs one control entry (24 bytes) and extra data
+    const numGaps = blk: {
+        var count: usize = 0;
+        for (0..numChunks) |i| {
+            if (chunkMergeInfo[i].gapEnd > chunkMergeInfo[i].gapStart) count += 1;
+        }
+        break :blk count;
+    };
+    totalControlLen += numGaps * 24;
+    totalExtraLen += totalGapBytes;
+
+    // Account for seek-only entries: each chunk after the first with kept entries needs one
+    // to adjust oldpos before reading the first kept entry's diff
+    const numSeekEntries = blk: {
+        var count: usize = 0;
+        for (1..numChunks) |i| {
+            if (chunkResults[i].controlLen > chunkMergeInfo[i].controlSkip) count += 1;
+        }
+        break :blk count;
+    };
+    totalControlLen += numSeekEntries * 24;
 
     // Allocate merged buffers
     var controlBlockStream = try allocator.alloc(u8, @max(totalControlLen, 64 * 1024));
     var diffBlockStream = try allocator.alloc(u8, @max(totalDiffLen, 1024));
-    var extraBlockStream = try allocator.alloc(u8, @max(totalExtraLen, 1024));
+    var extraBlockStream = try allocator.alloc(u8, @max(totalExtraLen + totalGapBytes, 1024));
 
-    // Copy data from chunks, skipping overlaps
-    // Track the oldpos at the end of the previous chunk to adjust seekBy for chunk boundaries
+    // Copy data from chunks, inserting gap-fill entries where needed
+    // Track oldpos for adjusting seekBy values at chunk boundaries
     var controlOffset: usize = 0;
     var diffOffset: usize = 0;
     var extraOffset: usize = 0;
-    var prevChunkEndOldpos: i64 = 0; // Where oldpos ends after each chunk (after adjustment)
+    var prevChunkEndOldpos: i64 = 0;
 
     for (0..numChunks) |i| {
-        const skipControlBytes = chunkDataStarts[i];
+        const info = chunkMergeInfo[i];
+        const gapSize = if (info.gapEnd > info.gapStart) info.gapEnd - info.gapStart else 0;
 
-        // Calculate corresponding diff/extra skip amounts AND the oldpos delta of skipped blocks
-        var skipDiffBytes: usize = 0;
-        var skipExtraBytes: usize = 0;
+        // If there's a gap, insert a control entry to fill it with extra data
+        if (gapSize > 0) {
+            // Control entry: diffBy=0, extraBy=gapSize, seekBy=0
+            // This tells bspatch to copy gapSize bytes from extra block to output
+            // Note: oldpos doesn't change (seekBy=0, diffBy=0)
+            offtout(0, controlBlockStream[controlOffset..][0..8]); // diffBy = 0
+            controlOffset += 8;
+            offtout(@intCast(gapSize), controlBlockStream[controlOffset..][0..8]); // extraBy = gapSize
+            controlOffset += 8;
+            offtout(0, controlBlockStream[controlOffset..][0..8]); // seekBy = 0
+            controlOffset += 8;
+
+            // Copy the gap bytes from newData to extra block
+            @memcpy(extraBlockStream[extraOffset..][0..gapSize], newData[info.gapStart..info.gapEnd]);
+            extraOffset += gapSize;
+        }
+
+        // Calculate skippedOldposDelta: how much oldpos would have moved through skipped entries
         var skippedOldposDelta: i64 = 0;
         var ctrlPos: usize = 0;
-        while (ctrlPos < skipControlBytes) {
+        while (ctrlPos < info.controlSkip) {
             const forwardLen = offtin(chunkResults[i].controlData[ctrlPos..][0..8]);
-            const extraLen = offtin(chunkResults[i].controlData[ctrlPos + 8 ..][0..16][0..8]);
-            const seekBySkipped = offtin(chunkResults[i].controlData[ctrlPos + 16 ..][0..8]);
-            skipDiffBytes += @intCast(forwardLen);
-            skipExtraBytes += @intCast(extraLen);
-            skippedOldposDelta += forwardLen + seekBySkipped;
+            const seekByVal = offtin(chunkResults[i].controlData[ctrlPos + 16 ..][0..8]);
+            skippedOldposDelta += forwardLen + seekByVal;
             ctrlPos += 24;
         }
 
-        const controlToCopy = chunkResults[i].controlLen - skipControlBytes;
-        const diffToCopy = chunkResults[i].diffLen - skipDiffBytes;
-        const extraToCopy = chunkResults[i].extraLen - skipExtraBytes;
+        // Copy this chunk's remaining control/diff/extra data
+        const controlToCopy = chunkResults[i].controlLen - info.controlSkip;
+        const diffToCopy = chunkResults[i].diffLen - info.diffSkip;
+        const extraToCopy = chunkResults[i].extraLen - info.extraSkip;
 
         if (controlToCopy > 0) {
-            // Calculate the delta for the remaining (non-skipped) control blocks
-            var remainingDelta: i64 = 0;
-            var pos: usize = skipControlBytes;
+            // For chunks after the first, insert a "seek-only" entry to adjust oldpos
+            // The diff data was computed using the chunk's internal oldpos tracking,
+            // so we need oldpos to be at skippedOldposDelta before reading the first entry
+            if (i > 0) {
+                const seekAdjustment = skippedOldposDelta - prevChunkEndOldpos;
+                offtout(0, controlBlockStream[controlOffset..][0..8]); // diffBy = 0
+                controlOffset += 8;
+                offtout(0, controlBlockStream[controlOffset..][0..8]); // extraBy = 0
+                controlOffset += 8;
+                offtout(seekAdjustment, controlBlockStream[controlOffset..][0..8]); // seekBy = adjustment
+                controlOffset += 8;
+                // After this entry: oldpos = prevChunkEndOldpos + 0 + seekAdjustment = skippedOldposDelta
+                prevChunkEndOldpos = skippedOldposDelta;
+            }
+
+            // Copy the chunk's kept entries unchanged (no seekBy adjustment needed)
+            @memcpy(controlBlockStream[controlOffset..][0..controlToCopy], chunkResults[i].controlData[info.controlSkip..][0..controlToCopy]);
+
+            // Calculate where oldpos ends after this chunk's remaining entries
+            var chunkOldposDelta: i64 = 0;
+            var pos: usize = info.controlSkip;
             while (pos < chunkResults[i].controlLen) {
-                const readDiffBy = offtin(chunkResults[i].controlData[pos..][0..8]);
-                const seekBy = offtin(chunkResults[i].controlData[pos + 16 ..][0..8]);
-                remainingDelta += readDiffBy + seekBy;
+                const forwardLen = offtin(chunkResults[i].controlData[pos..][0..8]);
+                const seekByVal = offtin(chunkResults[i].controlData[pos + 16 ..][0..8]);
+                chunkOldposDelta += forwardLen + seekByVal;
                 pos += 24;
             }
 
-            // Copy control data
-            @memcpy(controlBlockStream[controlOffset..][0..controlToCopy], chunkResults[i].controlData[skipControlBytes..][0..controlToCopy]);
-
-            // For chunks after the first, adjust the first control block's seekBy
-            // The first remaining block's seekBy was calculated assuming we're at the end
-            // of the skipped blocks (skippedOldposDelta). But we're actually at prevChunkEndOldpos.
-            if (i > 0 and controlToCopy >= 24) {
-                // Read the current seekBy (third i64 in control block)
-                const currentSeekBy = offtin(controlBlockStream[controlOffset + 16 ..][0..8]);
-                // The first remaining block expects oldpos = skippedOldposDelta
-                // We're actually at oldpos = prevChunkEndOldpos
-                // Adjust: new_seekBy = currentSeekBy + skippedOldposDelta - prevChunkEndOldpos
-                const adjustedSeekBy = currentSeekBy + skippedOldposDelta - prevChunkEndOldpos;
-                // Write back the adjusted value
-                offtout(adjustedSeekBy, controlBlockStream[controlOffset + 16 ..][0..8]);
-            }
-
-            // After applying this chunk's remaining blocks (with adjustment),
-            // oldpos ends at: skippedOldposDelta + remainingDelta
-            // But we adjusted so that we start from prevChunkEndOldpos instead of 0,
-            // so the actual ending oldpos is: remainingDelta + skippedOldposDelta
-            prevChunkEndOldpos = skippedOldposDelta + remainingDelta;
-
+            prevChunkEndOldpos += chunkOldposDelta;
             controlOffset += controlToCopy;
         }
 
         if (diffToCopy > 0) {
-            @memcpy(diffBlockStream[diffOffset..][0..diffToCopy], chunkResults[i].diffData[skipDiffBytes..][0..diffToCopy]);
+            @memcpy(diffBlockStream[diffOffset..][0..diffToCopy], chunkResults[i].diffData[info.diffSkip..][0..diffToCopy]);
             diffOffset += diffToCopy;
         }
 
         if (extraToCopy > 0) {
-            @memcpy(extraBlockStream[extraOffset..][0..extraToCopy], chunkResults[i].extraData[skipExtraBytes..][0..extraToCopy]);
+            @memcpy(extraBlockStream[extraOffset..][0..extraToCopy], chunkResults[i].extraData[info.extraSkip..][0..extraToCopy]);
             extraOffset += extraToCopy;
         }
 
@@ -572,7 +654,10 @@ fn processChunk(
             var i: i64 = 0;
 
             // Calculate forward length
-            while (lastScanIndex + i < scanIndex and lastMatchPosition + i < oldsize) {
+            // When scanIndex >= newsize, we need to clamp to the actual file boundary
+            // to avoid creating control entries that extend past the new file
+            const effectiveScanIndex = @min(scanIndex, @as(i64, @intCast(newsize)));
+            while (lastScanIndex + i < effectiveScanIndex and lastMatchPosition + i < oldsize) {
                 if (oldData[@intCast(lastMatchPosition + i)] == newData[@intCast(lastScanIndex + i)]) {
                     scoreCounter += 1;
                 }
