@@ -194,10 +194,10 @@ pub fn calculateDifferences(allocator: *std.mem.Allocator, oldData: []const u8, 
 
     // Determine number of chunks based on CPU count
     const cpuCount = std.Thread.getCpuCount() catch 4;
-    // Use at most 8 threads, at least 1, and ensure chunks are at least 1MB
+    // Use all available CPUs, but ensure chunks are at least 1MB to avoid excessive overhead
     const minChunkSize: usize = 1024 * 1024; // 1MB minimum
-    const maxThreads = @min(cpuCount, 8);
-    const numChunks = @max(1, @min(maxThreads, newsize / minChunkSize));
+    const maxChunksBySize = newsize / minChunkSize;
+    const numChunks = @max(1, @min(cpuCount, maxChunksBySize));
 
     std.debug.print("Parallel diff with {d} chunks on {d} CPUs...\n", .{ numChunks, cpuCount });
 
