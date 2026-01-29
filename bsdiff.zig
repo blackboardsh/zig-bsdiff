@@ -363,9 +363,13 @@ pub fn calculateDifferences(allocator: *std.mem.Allocator, oldData: []const u8, 
                 };
 
                 totalGapBytes += gapSize;
-                totalControlLen += chunkResults[i].controlLen - controlOffset;
-                totalDiffLen += chunkResults[i].diffLen - diffOffset;
-                totalExtraLen += chunkResults[i].extraLen - extraOffset;
+                // Use saturating subtraction to handle edge cases where all entries are skipped
+                const controlKept = if (chunkResults[i].controlLen > controlOffset) chunkResults[i].controlLen - controlOffset else 0;
+                const diffKept = if (chunkResults[i].diffLen > diffOffset) chunkResults[i].diffLen - diffOffset else 0;
+                const extraKept = if (chunkResults[i].extraLen > extraOffset) chunkResults[i].extraLen - extraOffset else 0;
+                totalControlLen += controlKept;
+                totalDiffLen += diffKept;
+                totalExtraLen += extraKept;
             }
 
             // Update max coverage tracking
@@ -409,23 +413,27 @@ pub fn calculateDifferences(allocator: *std.mem.Allocator, oldData: []const u8, 
 
     for (0..numChunks) |i| {
         const info = chunkMergeInfo[i];
-        const gapSize = if (info.gapEnd > info.gapStart) info.gapEnd - info.gapStart else 0;
 
         // If there's a gap, insert a control entry to fill it with extra data
-        if (gapSize > 0) {
+        // Clamp gap to valid range within newData
+        const clampedGapEnd = @min(info.gapEnd, newsize);
+        const clampedGapStart = @min(info.gapStart, clampedGapEnd);
+        const actualGapSize = clampedGapEnd - clampedGapStart;
+
+        if (actualGapSize > 0) {
             // Control entry: diffBy=0, extraBy=gapSize, seekBy=0
             // This tells bspatch to copy gapSize bytes from extra block to output
             // Note: oldpos doesn't change (seekBy=0, diffBy=0)
             offtout(0, controlBlockStream[controlOffset..][0..8]); // diffBy = 0
             controlOffset += 8;
-            offtout(@intCast(gapSize), controlBlockStream[controlOffset..][0..8]); // extraBy = gapSize
+            offtout(@intCast(actualGapSize), controlBlockStream[controlOffset..][0..8]); // extraBy = gapSize
             controlOffset += 8;
             offtout(0, controlBlockStream[controlOffset..][0..8]); // seekBy = 0
             controlOffset += 8;
 
             // Copy the gap bytes from newData to extra block
-            @memcpy(extraBlockStream[extraOffset..][0..gapSize], newData[info.gapStart..info.gapEnd]);
-            extraOffset += gapSize;
+            @memcpy(extraBlockStream[extraOffset..][0..actualGapSize], newData[clampedGapStart..clampedGapEnd]);
+            extraOffset += actualGapSize;
         }
 
         // Calculate skippedOldposDelta: how much oldpos would have moved through skipped entries

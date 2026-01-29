@@ -192,44 +192,82 @@ test "bsdiff/bspatch roundtrip with large files" {
     try std.testing.expectEqualSlices(u8, newFile, patchedFile);
 }
 
-// Test with files that have truly independent regions to force partial chunk overlaps
-// This creates a "stripe" pattern where old and new are identical in odd regions
-// but completely different in even regions, forcing chunks to stop at stripe boundaries
-test "bsdiff/bspatch roundtrip with striped content (partial overlaps)" {
+// Test specifically for the parallel chunk merging bug where:
+// 1. Chunk N extends further than chunk N+1 (requires maxActualEndSoFar tracking)
+// 2. Kept entries at boundaries need correct oldpos (requires seek-only entry)
+//
+// The bug manifested when:
+// - Chunk 0 extended to position X
+// - Chunk 1 extended to position Y > X (further than chunk 0)
+// - Chunks 2-5 extended to position Z < Y (less than chunk 1)
+// - The code incorrectly used chunkResults[i-1].actualEndPos instead of max seen
+// - The diff data was computed with chunk's internal oldpos, but seekBy adjustment
+//   happened AFTER reading (should be BEFORE via seek-only entry)
+test "bsdiff/bspatch parallel chunk boundary handling" {
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
 
     const allocator = arena.allocator();
 
-    // Create 8MB files (enough for 8 chunks of 1MB each)
-    const fileSize: usize = 8 * 1024 * 1024;
-    const stripeSize: usize = 512 * 1024; // 512KB stripes
+    // Create 10MB files to trigger multiple chunks (minChunkSize is 1MB)
+    // With 10MB and up to 8 threads, we get chunks of ~1.25MB each
+    const fileSize: usize = 10 * 1024 * 1024;
 
     var oldFile = try allocator.alloc(u8, fileSize);
     var newFile = try allocator.alloc(u8, fileSize);
 
-    var prng = std.Random.DefaultPrng.init(77777);
+    // Strategy: Create a pattern where chunks extend differently
+    // - Region A (0-2MB): identical - chunk 0 processes, may extend
+    // - Region B (2MB-3MB): DIFFERENT - creates boundary, forces extra data
+    // - Region C (3MB-7MB): identical - chunks can find matches and extend
+    // - Region D (7MB-8MB): DIFFERENT - another boundary
+    // - Region E (8MB-10MB): identical - final region
+    //
+    // This pattern causes:
+    // - Early chunks to extend through the identical regions
+    // - Later chunks starting in different regions to have different extension patterns
+    // - Boundaries where kept entries need correct oldpos alignment
+
+    var prng = std.Random.DefaultPrng.init(54321);
     var random = prng.random();
 
-    // Fill oldFile with random data
+    // Fill oldFile with deterministic pattern
     for (0..fileSize) |i| {
-        oldFile[i] = random.int(u8);
+        oldFile[i] = @truncate((i * 7 + 13) % 256);
     }
 
-    // For newFile:
-    // - Odd stripes (1, 3, 5, ...): SAME as oldFile (good matches)
-    // - Even stripes (0, 2, 4, ...): DIFFERENT data (no matches, forces extra block)
-    var prng2 = std.Random.DefaultPrng.init(88888);
-    var random2 = prng2.random();
+    // Copy to newFile
+    @memcpy(newFile, oldFile);
 
-    for (0..fileSize) |i| {
-        const stripeIdx = i / stripeSize;
-        if (stripeIdx % 2 == 0) {
-            // Even stripe: completely different data
-            newFile[i] = random2.int(u8);
-        } else {
-            // Odd stripe: same as oldFile
-            newFile[i] = oldFile[i];
+    // Make regions B and D completely different
+    const regionB_start: usize = 2 * 1024 * 1024;
+    const regionB_end: usize = 3 * 1024 * 1024;
+    const regionD_start: usize = 7 * 1024 * 1024;
+    const regionD_end: usize = 8 * 1024 * 1024;
+
+    for (regionB_start..regionB_end) |i| {
+        newFile[i] = random.int(u8);
+    }
+    for (regionD_start..regionD_end) |i| {
+        newFile[i] = random.int(u8);
+    }
+
+    // Also make small scattered changes to create more interesting diff patterns
+    // These changes in the "identical" regions create entries with non-trivial seekBy values
+    const changePositions = [_]usize{
+        500 * 1024,       // 500KB - in region A
+        1500 * 1024,      // 1.5MB - in region A
+        4 * 1024 * 1024,  // 4MB - in region C
+        5 * 1024 * 1024,  // 5MB - in region C
+        6 * 1024 * 1024,  // 6MB - in region C
+        9 * 1024 * 1024,  // 9MB - in region E
+    };
+
+    for (changePositions) |pos| {
+        if (pos + 100 < fileSize) {
+            for (0..100) |j| {
+                newFile[pos + j] = random.int(u8);
+            }
         }
     }
 
