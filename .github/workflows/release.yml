@@ -22,18 +22,23 @@ jobs:
           - os: macos-14
             platform: darwin
             arch: arm64
+            zig-target: aarch64-macos
           - os: macos-15-intel
             platform: darwin
             arch: x64
+            zig-target: x86_64-macos
           - os: ubuntu-24.04
             platform: linux
             arch: x64
+            zig-target: x86_64-linux
           - os: ubuntu-24.04-arm
             platform: linux
             arch: arm64
+            zig-target: aarch64-linux
           - os: windows-2025
             platform: win32
             arch: x64
+            zig-target: x86_64-windows
 
     runs-on: ${{ matrix.os }}
 
@@ -66,7 +71,7 @@ jobs:
 
       - name: Build binaries
         run: |
-          zig build -Doptimize=ReleaseFast
+          zig build -Doptimize=ReleaseFast -Dtarget=${{ matrix.zig-target }} -Dcpu=baseline
 
       - name: Rebuild bspatch with MSVC ABI (Windows)
         if: matrix.platform == 'win32'
