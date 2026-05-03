@@ -54,27 +54,63 @@ async function vendorLibsais() {
       console.log('✓ libsais source downloaded');
     }
 
-    // Compile libsais (Zig's C backend has issues with libsais)
-    console.log('Compiling libsais...');
+    // Compile libsais using the vendored Zig's clang (`zig cc`) on every
+    // platform. This used to call out to `gcc`/`clang` from PATH (and required
+    // installing MinGW on Windows CI), but that produced binaries that included
+    // post-baseline x86 instructions on some MinGW-w64 distributions, crashing
+    // with STATUS_ILLEGAL_INSTRUCTION on hosts without those instructions
+    // (e.g. ARM64 Windows running x64 under emulation, or older Intel CPUs).
+    // Using zig's bundled clang gives us:
+    //   - one toolchain on every CI host (no `choco install mingw` step)
+    //   - the same baseline x86_64 ISA as `zig build -Dcpu=baseline` produces
+    //     for the surrounding zig code, so the linked binary is uniformly
+    //     baseline-safe.
+    // The .a is GNU-ABI; on Windows the surrounding `zig build` uses the
+    // matching `x86_64-windows` GNU target, so linking is clean.
+    console.log('Compiling libsais with zig cc...');
 
-    const compiler = platform === 'win32' ? 'gcc' : 'clang';
+    const zigBinary = platform === 'win32' ? 'zig.exe' : 'zig';
+    const zigPath = join(process.cwd(), 'vendors', 'zig', zigBinary);
     const wrapperDir = join(process.cwd(), 'src', 'libsais-wrapper');
+
+    // Map node's host platform/arch to a zig target triple. The CI matrix
+    // always runs the build on the same arch as the artifact it produces,
+    // so targeting the host is correct.
+    const arch = process.arch;
+    const zigArch = arch === 'arm64' ? 'aarch64' : 'x86_64';
+    let zigTarget;
+    if (platform === 'win32') {
+      zigTarget = `${zigArch}-windows-gnu`;
+    } else if (platform === 'darwin') {
+      zigTarget = `${zigArch}-macos`;
+    } else if (platform === 'linux') {
+      zigTarget = `${zigArch}-linux-gnu`;
+    } else {
+      throw new Error(`Unsupported platform for libsais build: ${platform}`);
+    }
+
+    const cflags = `-target ${zigTarget} -c -O3 -std=c99`;
 
     // Compile libsais source files
     execSync(
-      `cd ${libsaisDir} && ${compiler} -c -O3 -std=c99 libsais.c libsais64.c`,
+      `"${zigPath}" cc ${cflags} ${join(libsaisDir, 'libsais.c')} -o ${join(libsaisDir, 'libsais.o')}`,
+      { stdio: 'inherit' }
+    );
+    execSync(
+      `"${zigPath}" cc ${cflags} ${join(libsaisDir, 'libsais64.c')} -o ${join(libsaisDir, 'libsais64.o')}`,
       { stdio: 'inherit' }
     );
 
     // Compile wrapper with include path to libsais headers
     execSync(
-      `${compiler} -c -O3 -std=c99 -I ${libsaisDir} ${wrapperDir}/zig_wrapper.c -o ${libsaisDir}/zig_wrapper.o`,
+      `"${zigPath}" cc ${cflags} -I ${libsaisDir} ${join(wrapperDir, 'zig_wrapper.c')} -o ${join(libsaisDir, 'zig_wrapper.o')}`,
       { stdio: 'inherit' }
     );
 
-    // Create static library
+    // Create static library using zig's bundled llvm-ar (works on every
+    // platform without depending on a system `ar`).
     execSync(
-      `cd ${libsaisDir} && ar rcs libsais.a libsais.o libsais64.o zig_wrapper.o`,
+      `"${zigPath}" ar rcs ${join(libsaisDir, 'libsais.a')} ${join(libsaisDir, 'libsais.o')} ${join(libsaisDir, 'libsais64.o')} ${join(libsaisDir, 'zig_wrapper.o')}`,
       { stdio: 'inherit' }
     );
 

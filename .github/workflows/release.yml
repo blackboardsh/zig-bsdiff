@@ -59,11 +59,10 @@ jobs:
         if: matrix.platform == 'win32'
         uses: ilammy/msvc-dev-cmd@v1
 
-      - name: Setup MinGW on Windows (for libsais compilation)
-        if: matrix.platform == 'win32'
-        run: |
-          choco install mingw -y
-          refreshenv
+      # libsais is now compiled by `zig cc` inside scripts/setup.js, so MinGW
+      # is no longer needed on Windows. (Previously `choco install mingw` was
+      # required to provide gcc; that toolchain was producing post-baseline
+      # instructions that crashed on some Intel CPUs and ARM64 emulation.)
 
       - name: Setup dependencies
         run: |
