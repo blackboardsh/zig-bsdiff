@@ -46,6 +46,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
+          ref: ${{ github.event.inputs.tag || github.ref }}
 
       - uses: goto-bus-stop/setup-zig@v2
         with:
@@ -109,11 +110,25 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
 
       - name: Download all artifacts
         uses: actions/download-artifact@v4
         with:
           path: artifacts
+
+      - name: Publish immutable release to R2
+        env:
+          RELEASE_TAG: ${{ github.event.inputs.tag || github.ref_name }}
+          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+        run: node scripts/upload-release-r2.js --artifacts=artifacts
 
       - name: Create Release
         uses: softprops/action-gh-release@v1
@@ -121,6 +136,7 @@ jobs:
           tag_name: ${{ github.event.inputs.tag || github.ref_name }}
           files: |
             artifacts/**/*.tar.gz
+            artifacts/**/*.tar.gz.sha256
           generate_release_notes: true
           prerelease: ${{ github.event.inputs.prerelease || contains(github.ref_name, '-beta') || contains(github.event.inputs.tag, '-beta') }}
           body: |
