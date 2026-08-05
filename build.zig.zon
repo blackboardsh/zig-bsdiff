@@ -1,0 +1,17 @@
+.{
+    .name = .zig_bsdiff,
+    .version = "0.1.22",
+    .fingerprint = 0x62e8d6dd9d77f237,
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{},
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "bsdiff.zig",
+        "bspatch.zig",
+        "tests.zig",
+        "src",
+        "LICENSE",
+        "README.md",
+    },
+}

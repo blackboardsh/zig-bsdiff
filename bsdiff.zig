@@ -87,24 +87,20 @@ const ChunkResult = struct {
 // 6. create electrobun update api to check for updates, download, apply patches, and restart the app.
 
 // 7. then later move bsdiff to its own repo, implement bzip backwards compatability, and a npm package with typescript wrapper.
-pub fn main() !void {
-    var allocator = std.heap.page_allocator;
+pub fn main(init: std.process.Init) !void {
+    var allocator = init.gpa;
+    const io = init.io;
 
-    var args = try std.process.argsWithAllocator(allocator);
+    const args = try init.minimal.args.toSlice(init.arena.allocator());
 
-    defer args.deinit();
-
-    // skip the first arg which is the program name
-    _ = args.skip();
-
-    const oldFilePath = args.next() orelse "";
-    const newFilePath = args.next() orelse "";
-    const patchFilePath = args.next() orelse "";
+    const oldFilePath: []const u8 = if (args.len > 1) args[1] else "";
+    const newFilePath: []const u8 = if (args.len > 2) args[2] else "";
+    const patchFilePath: []const u8 = if (args.len > 3) args[3] else "";
     // By default we compress the blocks with bzip2 to make patches compatible with
     // the original bsdiff implementation.
     // In electrobun we disable block compression and compress the whole patch file with zstd
     // in a separate process.
-    const optionUseZstd = args.next() orelse "";
+    const optionUseZstd: []const u8 = if (args.len > 4) args[4] else "";
     const useZstd = std.mem.eql(u8, optionUseZstd, "--use-zstd");
 
     if (oldFilePath.len == 0 or newFilePath.len == 0 or patchFilePath.len == 0) {
@@ -113,26 +109,16 @@ pub fn main() !void {
         std.process.exit(1);
     }
 
-    const oldFile = try std.fs.cwd().openFile(oldFilePath, .{ .mode = .read_only });
-    defer oldFile.close();
-
-    const oldFileSize = try oldFile.getEndPos();
-    const oldFileBuff = try allocator.alloc(u8, oldFileSize);
+    const oldFileBuff = try std.Io.Dir.cwd().readFileAlloc(io, oldFilePath, allocator, .unlimited);
     defer allocator.free(oldFileBuff);
-    _ = try oldFile.readAll(oldFileBuff);
 
-    const newFile = try std.fs.cwd().openFile(newFilePath, .{ .mode = .read_only });
-    defer newFile.close();
-
-    const newFileSize = try newFile.getEndPos();
-    const newFileBuff = try allocator.alloc(u8, newFileSize);
+    const newFileBuff = try std.Io.Dir.cwd().readFileAlloc(io, newFilePath, allocator, .unlimited);
     defer allocator.free(newFileBuff);
-    _ = try newFile.readAll(newFileBuff);
 
     // Log system info and file sizes
     const cpuCount = try std.Thread.getCpuCount();
-    const oldSizeMB = @as(f64, @floatFromInt(oldFileSize)) / (1024.0 * 1024.0);
-    const newSizeMB = @as(f64, @floatFromInt(newFileSize)) / (1024.0 * 1024.0);
+    const oldSizeMB = @as(f64, @floatFromInt(oldFileBuff.len)) / (1024.0 * 1024.0);
+    const newSizeMB = @as(f64, @floatFromInt(newFileBuff.len)) / (1024.0 * 1024.0);
 
     std.debug.print("System Info:\n", .{});
     std.debug.print("  CPUs: {d}\n", .{cpuCount});
@@ -146,16 +132,18 @@ pub fn main() !void {
     std.debug.print("Generating Patch file to turn File A into File B...", .{});
     std.debug.print("\n", .{});
 
-    const patch = try calculateDifferences(&allocator, oldFileBuff, newFileBuff, useZstd);
+    const patch = try calculateDifferences(&allocator, io, oldFileBuff, newFileBuff, useZstd);
 
     // Write the patch file, internal blocks compressed with bzip2
-    const patchFile = try std.fs.cwd().createFile(patchFilePath, .{});
-    defer patchFile.close();
-
-    _ = try patchFile.writeAll(patch);
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = patchFilePath, .data = patch });
 }
 
-pub fn calculateDifferences(allocator: *std.mem.Allocator, oldData: []const u8, newData: []const u8, useZstd: bool) ![]u8 {
+/// Millisecond monotonic-ish timestamp used for phase timing logs.
+fn nowMs(io: std.Io) i64 {
+    return std.Io.Timestamp.now(io, .awake).toMilliseconds();
+}
+
+pub fn calculateDifferences(allocator: *std.mem.Allocator, io: std.Io, oldData: []const u8, newData: []const u8, useZstd: bool) ![]u8 {
     if (!useZstd) {
         std.debug.print("Block compression with bzip2 not yet implemented.\n", .{});
     }
@@ -165,7 +153,7 @@ pub fn calculateDifferences(allocator: *std.mem.Allocator, oldData: []const u8, 
     defer allocator.free(suffixIndexes);
 
     std.debug.print("Building suffix array with libsais64...\n", .{});
-    const saisStart = std.time.milliTimestamp();
+    const saisStart = nowMs(io);
 
     // Use libsais64 for fast suffix array construction (3-7x faster than qsufsort)
     const oldDataLen: i64 = @intCast(oldData.len);
@@ -180,7 +168,7 @@ pub fn calculateDifferences(allocator: *std.mem.Allocator, oldData: []const u8, 
         return error.SuffixArrayConstructionFailed;
     }
 
-    const saisTime = std.time.milliTimestamp() - saisStart;
+    const saisTime = nowMs(io) - saisStart;
     const saisTimeSec = @as(f64, @floatFromInt(saisTime)) / 1000.0;
     std.debug.print("Suffix array built in {d:.2}s\n", .{saisTimeSec});
 
@@ -190,7 +178,7 @@ pub fn calculateDifferences(allocator: *std.mem.Allocator, oldData: []const u8, 
     const newsize = newData.len;
 
     // Timing for diff phase
-    const diffPhaseStart = std.time.milliTimestamp();
+    const diffPhaseStart = nowMs(io);
 
     // Determine number of chunks based on CPU count
     const cpuCount = std.Thread.getCpuCount() catch 4;
@@ -233,8 +221,9 @@ pub fn calculateDifferences(allocator: *std.mem.Allocator, oldData: []const u8, 
 
     // Start a progress reporting thread
     var progressRunning: bool = true;
-    const progressStart = std.time.milliTimestamp();
+    const progressStart = nowMs(io);
     const progressThread = try std.Thread.spawn(.{}, reportDiffProgress, .{
+        io,
         &progressRunning,
         &completedChunks,
         numChunks,
@@ -251,7 +240,7 @@ pub fn calculateDifferences(allocator: *std.mem.Allocator, oldData: []const u8, 
     progressThread.join();
 
     // Report diff phase timing
-    const diffPhaseTime = std.time.milliTimestamp() - diffPhaseStart;
+    const diffPhaseTime = nowMs(io) - diffPhaseStart;
     const diffPhaseSec = @as(f64, @floatFromInt(diffPhaseTime)) / 1000.0;
     std.debug.print("Diff phase: {d:.2}s (parallel)\n", .{diffPhaseSec});
 
@@ -502,41 +491,36 @@ pub fn calculateDifferences(allocator: *std.mem.Allocator, oldData: []const u8, 
 
     // Now compress the merged data
     std.debug.print("Compressing...\n", .{});
-    const compressStart = std.time.milliTimestamp();
+    const compressStart = nowMs(io);
 
-    var streamingBytes = true;
     var controlBlockInput = zstd.ZSTD_inBuffer{ .src = controlBlockStream.ptr, .size = controlOffset, .pos = 0 };
     const controlBlockCompressed = try allocator.alloc(u8, zstd.ZSTD_compressBound(controlOffset));
     var controlBlockOutput = zstd.ZSTD_outBuffer{ .dst = controlBlockCompressed.ptr, .size = controlBlockCompressed.len, .pos = 0 };
-    const controlBlockThread = try std.Thread.spawn(.{}, compressBlockStream, .{ &controlBlockInput, &controlBlockOutput, &streamingBytes });
+    const controlBlockThread = try std.Thread.spawn(.{}, compressBlockStream, .{ &controlBlockInput, &controlBlockOutput });
 
     var diffBlockInput = zstd.ZSTD_inBuffer{ .src = diffBlockStream.ptr, .size = diffOffset, .pos = 0 };
     const diffBlockCompressed = try allocator.alloc(u8, zstd.ZSTD_compressBound(diffOffset));
     var diffBlockOutput = zstd.ZSTD_outBuffer{ .dst = diffBlockCompressed.ptr, .size = diffBlockCompressed.len, .pos = 0 };
-    const diffBlockThread = try std.Thread.spawn(.{}, compressBlockStream, .{ &diffBlockInput, &diffBlockOutput, &streamingBytes });
+    const diffBlockThread = try std.Thread.spawn(.{}, compressBlockStream, .{ &diffBlockInput, &diffBlockOutput });
 
     var extraBlockInput = zstd.ZSTD_inBuffer{ .src = extraBlockStream.ptr, .size = extraOffset, .pos = 0 };
     const extraBlockCompressed = try allocator.alloc(u8, zstd.ZSTD_compressBound(extraOffset));
     var extraBlockOutput = zstd.ZSTD_outBuffer{ .dst = extraBlockCompressed.ptr, .size = extraBlockCompressed.len, .pos = 0 };
-    const extraBlockThread = try std.Thread.spawn(.{}, compressBlockStream, .{ &extraBlockInput, &extraBlockOutput, &streamingBytes });
-
-    // Wait a bit then signal completion
-    std.time.sleep(std.time.ns_per_ms * 10);
-    streamingBytes = false;
+    const extraBlockThread = try std.Thread.spawn(.{}, compressBlockStream, .{ &extraBlockInput, &extraBlockOutput });
 
     controlBlockThread.join();
     diffBlockThread.join();
     extraBlockThread.join();
 
-    const compressTime = std.time.milliTimestamp() - compressStart;
+    const compressTime = nowMs(io) - compressStart;
     const compressTimeSec = @as(f64, @floatFromInt(compressTime)) / 1000.0;
     std.debug.print("Compression: {d:.2}s\n", .{compressTimeSec});
 
     // Header is
-    //	0	8	"BSDIFF40" or "TRDIFF10"
-    //	8	8	length of ctrl block  i64
-    //	16	8	length of diff block  i64
-    //	24	8	length of new file    i64
+    // 0 8 "BSDIFF40" or "TRDIFF10"
+    // 8 8 length of ctrl block  i64
+    // 16 8 length of diff block  i64
+    // 24 8 length of new file    i64
 
     // Placeholder for the buffer used in offtout
     var buffer = [_]u8{0} ** 8;
@@ -796,6 +780,7 @@ fn processChunk(
 
 /// Progress reporting thread for parallel diff
 fn reportDiffProgress(
+    io: std.Io,
     running: *bool,
     completedChunks: *usize,
     numChunks: usize,
@@ -804,9 +789,9 @@ fn reportDiffProgress(
     var lastPrintTime: i64 = startTime;
 
     while (@atomicLoad(bool, running, .seq_cst)) {
-        std.time.sleep(std.time.ns_per_s * 1); // Check every second
+        std.Io.sleep(io, .fromSeconds(1), .awake) catch {}; // Check every second
 
-        const now = std.time.milliTimestamp();
+        const now = nowMs(io);
         const elapsed = now - startTime;
         const elapsedSec = @as(f64, @floatFromInt(elapsed)) / 1000.0;
         const timeSinceLastPrint = now - lastPrintTime;
@@ -859,7 +844,7 @@ fn compressBlock(allocator: *std.mem.Allocator, block: []const u8) !void {
     // return compressedBlock[0..compressedSize];
 }
 
-fn compressBlockStream(input: *zstd.ZSTD_inBuffer, output: *zstd.ZSTD_outBuffer, streamingBytes: *bool) !void {
+fn compressBlockStream(input: *zstd.ZSTD_inBuffer, output: *zstd.ZSTD_outBuffer) void {
     const cstream = zstd.ZSTD_createCStream();
     defer {
         _ = zstd.ZSTD_freeCStream(cstream);
@@ -873,12 +858,10 @@ fn compressBlockStream(input: *zstd.ZSTD_inBuffer, output: *zstd.ZSTD_outBuffer,
     // obviously this will vary based on the data being compressed.
     _ = zstd.ZSTD_initCStream(cstream, 19);
 
-    while (streamingBytes.* or input.pos < input.size) {
-        if (input.pos < input.size) {
-            _ = zstd.ZSTD_compressStream(cstream, output, input);
-        } else {
-            std.time.sleep(std.time.ns_per_ms * 10);
-        }
+    // The input buffer is fully populated before the thread is spawned, so we
+    // can drain it and end the stream without any polling.
+    while (input.pos < input.size) {
+        _ = zstd.ZSTD_compressStream(cstream, output, input);
     }
 
     _ = zstd.ZSTD_endStream(cstream, output);
@@ -1202,13 +1185,10 @@ fn qsufsortFast(allocator: *std.mem.Allocator, suffixIndexes: []i64, buf: []cons
     defer allocator.free(inverseSuffix);
     const bufzise = buf.len;
     const bufzisePlusOne: i64 = @intCast(buf.len + 1);
-    var startTime = std.time.milliTimestamp();
 
     for (buf) |b| {
         buckets[b] += 1;
     }
-
-    startTime = std.time.milliTimestamp();
 
     // looping up, set each element to the sum of the previous elements
     // bucket[1] = bucket[0] + bucket[1];
@@ -1232,7 +1212,6 @@ fn qsufsortFast(allocator: *std.mem.Allocator, suffixIndexes: []i64, buf: []cons
     }
     // at this point we have the suffixes sorted by bucket
 
-    startTime = std.time.milliTimestamp();
     suffixIndexes[0] = @intCast(bufzise);
 
     // create inverseSuffix that maps each suffix to the last index of
@@ -1240,8 +1219,6 @@ fn qsufsortFast(allocator: *std.mem.Allocator, suffixIndexes: []i64, buf: []cons
     for (buf, 0..) |b, i| {
         inverseSuffix[i] = buckets[b];
     }
-
-    startTime = std.time.milliTimestamp();
 
     inverseSuffix[bufzise] = 0;
 
@@ -1283,13 +1260,9 @@ fn qsufsortFast(allocator: *std.mem.Allocator, suffixIndexes: []i64, buf: []cons
         h += h;
     }
 
-    startTime = std.time.milliTimestamp();
-
     for (0..buf.len) |i| {
         suffixIndexes[@intCast(inverseSuffix[@intCast(i)])] = @intCast(i);
     }
-
-    startTime = std.time.milliTimestamp();
 
     suffixIndexes[0] = 0;
 }
@@ -1419,9 +1392,9 @@ fn split(suffixIndexes: []i64, inverseSuffix: []i64, start: i64, ln: i64, h: i64
     }
 }
 
-fn logProgressPhase(running: *bool, percent: *f32, bytes: *usize, total: usize, phase: *[]const u8) void {
+fn logProgressPhase(io: std.Io, running: *bool, percent: *f32, bytes: *usize, total: usize, phase: *[]const u8) void {
     while (running.*) {
-        std.time.sleep(std.time.ns_per_s * 10); // Wait 10s between messages
+        std.Io.sleep(io, .fromSeconds(10), .awake) catch {}; // Wait 10s between messages
         if (!running.*) break;
         const bytesMB = @as(f64, @floatFromInt(bytes.*)) / (1024.0 * 1024.0);
         const totalMB = @as(f64, @floatFromInt(total)) / (1024.0 * 1024.0);

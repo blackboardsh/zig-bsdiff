@@ -2,9 +2,6 @@ const std = @import("std");
 const bsdiff = @import("bsdiff.zig");
 const bspatch = @import("bspatch.zig");
 
-const Header = std.tar.output.Header;
-const block_size: usize = 512;
-
 const FileSpec = struct {
     path: []const u8,
     contents: []const u8,
@@ -80,7 +77,7 @@ fn runRoundTripPatch(useZstd: bool) !void {
     const updatedTar = try buildTarArchive(allocator, updatedSpecs[0..]);
 
     var allocator_handle = allocator;
-    const patch = try bsdiff.calculateDifferences(&allocator_handle, originalTar, updatedTar, useZstd);
+    const patch = try bsdiff.calculateDifferences(&allocator_handle, std.testing.io, originalTar, updatedTar, useZstd);
 
     allocator_handle = allocator;
     const patchedTar = try bspatch.applyPatch(&allocator_handle, originalTar, patch);
@@ -89,51 +86,56 @@ fn runRoundTripPatch(useZstd: bool) !void {
 }
 
 fn buildTarArchive(allocator: std.mem.Allocator, specs: []const FileSpec) ![]u8 {
-    var buffer = std.ArrayList(u8).init(allocator);
-    defer buffer.deinit();
+    var allocating: std.Io.Writer.Allocating = .init(allocator);
+    defer allocating.deinit();
 
-    var writer = buffer.writer();
+    var tar_writer: std.tar.Writer = .{ .underlying_writer = &allocating.writer };
 
     for (specs) |spec| {
-        var header = Header.init();
-        try setName(&header, spec.path);
-        try writeOctal7(header.mode[0..header.mode.len], 0o644);
-        try writeOctal7(header.uid[0..header.uid.len], 0);
-        try writeOctal7(header.gid[0..header.gid.len], 0);
-        try header.setSize(spec.contents.len);
-        try writeOctal11(header.mtime[0..header.mtime.len], 0);
-        header.typeflag = .regular;
-        try header.updateChecksum();
-
-        try writer.writeAll(std.mem.asBytes(&header));
-        try writer.writeAll(spec.contents);
-
-        const remainder = spec.contents.len % block_size;
-        const padding = if (remainder == 0) 0 else block_size - remainder;
-        if (padding > 0) {
-            try writer.writeByteNTimes(0, padding);
-        }
+        try tar_writer.writeFileBytes(spec.path, spec.contents, .{ .mode = 0o644, .mtime = 0 });
     }
 
-    try writer.writeByteNTimes(0, block_size * 2);
+    // Writes the two trailing zero blocks that terminate a tar archive.
+    try tar_writer.finishPedantically();
 
-    return buffer.toOwnedSlice();
+    return allocating.toOwnedSlice();
 }
 
-fn setName(header: *Header, name: []const u8) !void {
-    if (name.len > header.name.len) return error.PathTooLong;
-    @memset(header.name[0..], 0);
-    @memcpy(header.name[0..name.len], name);
-}
+// Direct roundtrip on raw binary fixtures where the new file grows and
+// shrinks relative to the old file, exercising patches that change the
+// output size in both directions.
+test "bsdiff/bspatch roundtrip with binary size changes" {
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
 
-fn writeOctal7(buffer: []u8, value: u64) !void {
-    if (buffer.len < 7) return error.BufferTooSmall;
-    _ = try std.fmt.bufPrint(buffer[0..7], "{o:0>7}", .{value});
-}
+    const allocator = arena.allocator();
 
-fn writeOctal11(buffer: []u8, value: u64) !void {
-    if (buffer.len < 11) return error.BufferTooSmall;
-    _ = try std.fmt.bufPrint(buffer[0..11], "{o:0>11}", .{value});
+    var prng = std.Random.DefaultPrng.init(99);
+    var random = prng.random();
+
+    const oldFile = try allocator.alloc(u8, 256 * 1024);
+    random.bytes(oldFile);
+
+    // Grown file: original content with a small edit plus an appended section
+    const grown = try allocator.alloc(u8, oldFile.len + 32 * 1024);
+    @memcpy(grown[0..oldFile.len], oldFile);
+    @memcpy(grown[1024..][0..11], "hello world");
+    random.bytes(grown[oldFile.len..]);
+
+    // Shrunk file: the first half of the original with a small edit
+    const shrunk = try allocator.dupe(u8, oldFile[0 .. oldFile.len / 2]);
+    @memcpy(shrunk[2048..][0..9], "truncated");
+
+    for ([_][]const u8{ grown, shrunk }) |newFile| {
+        var allocator_handle = allocator;
+        const patchData = try bsdiff.calculateDifferences(&allocator_handle, std.testing.io, oldFile, newFile, true);
+
+        allocator_handle = allocator;
+        const patchedFile = try bspatch.applyPatch(&allocator_handle, oldFile, patchData);
+
+        try std.testing.expectEqual(newFile.len, patchedFile.len);
+        try std.testing.expectEqualSlices(u8, newFile, patchedFile);
+    }
 }
 
 // Test with larger files to exercise chunk boundary handling
@@ -183,7 +185,7 @@ test "bsdiff/bspatch roundtrip with large files" {
     }
 
     var allocator_handle = allocator;
-    const patchData = try bsdiff.calculateDifferences(&allocator_handle, oldFile, newFile, true);
+    const patchData = try bsdiff.calculateDifferences(&allocator_handle, std.testing.io, oldFile, newFile, true);
 
     allocator_handle = allocator;
     const patchedFile = try bspatch.applyPatch(&allocator_handle, oldFile, patchData);
@@ -272,7 +274,7 @@ test "bsdiff/bspatch parallel chunk boundary handling" {
     }
 
     var allocator_handle = allocator;
-    const patchData = try bsdiff.calculateDifferences(&allocator_handle, oldFile, newFile, true);
+    const patchData = try bsdiff.calculateDifferences(&allocator_handle, std.testing.io, oldFile, newFile, true);
 
     allocator_handle = allocator;
     const patchedFile = try bspatch.applyPatch(&allocator_handle, oldFile, patchData);

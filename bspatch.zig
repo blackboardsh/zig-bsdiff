@@ -38,47 +38,30 @@ const zstd = @cImport({
 
 const vectorSize = std.simd.suggestVectorLength(u8) orelse 4;
 
-pub fn main() !void {
-    var allocator = std.heap.page_allocator;
+pub fn main(init: std.process.Init) !void {
+    var allocator = init.gpa;
+    const io = init.io;
 
-    var args = try std.process.argsWithAllocator(allocator);
+    const args = try init.minimal.args.toSlice(init.arena.allocator());
 
-    defer args.deinit();
-
-    // skip the first arg which is the program name
-    _ = args.skip();
-
-    const oldFilePath = args.next() orelse "";
-    const newFilePath = args.next() orelse "";
-    const patchFilePath = args.next() orelse "";
+    const oldFilePath: []const u8 = if (args.len > 1) args[1] else "";
+    const newFilePath: []const u8 = if (args.len > 2) args[2] else "";
+    const patchFilePath: []const u8 = if (args.len > 3) args[3] else "";
 
     if (oldFilePath.len == 0 or newFilePath.len == 0 or patchFilePath.len == 0) {
-        std.debug.print("Usage: bsdiff <oldFilePath> <newFilePath> <patchFilePath>\n", .{});
+        std.debug.print("Usage: bspatch <oldFilePath> <newFilePath> <patchFilePath>\n", .{});
         std.process.exit(1);
     }
 
-    const oldFile = try std.fs.cwd().openFile(oldFilePath, .{ .mode = .read_only });
-    defer oldFile.close();
-
-    const oldFileSize = try oldFile.getEndPos();
-    const oldFileBuff = try allocator.alloc(u8, oldFileSize);
+    const oldFileBuff = try std.Io.Dir.cwd().readFileAlloc(io, oldFilePath, allocator, .unlimited);
     defer allocator.free(oldFileBuff);
-    _ = try oldFile.readAll(oldFileBuff);
 
-    const patchFile = try std.fs.cwd().openFile(patchFilePath, .{ .mode = .read_only });
-    defer patchFile.close();
-
-    const patchFileSize = try patchFile.getEndPos();
-    const patchFileBuff = try allocator.alloc(u8, patchFileSize);
+    const patchFileBuff = try std.Io.Dir.cwd().readFileAlloc(io, patchFilePath, allocator, .unlimited);
     defer allocator.free(patchFileBuff);
-    _ = try patchFile.readAll(patchFileBuff);
 
     const newfile = try applyPatch(&allocator, oldFileBuff, patchFileBuff);
 
-    const newFile = try std.fs.cwd().createFile(newFilePath, .{});
-    defer newFile.close();
-
-    _ = try newFile.writeAll(newfile);
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = newFilePath, .data = newfile });
 }
 
 /// Decompression result for parallel decompression
@@ -305,9 +288,9 @@ fn offtin(buf: []const u8) i64 {
     return y;
 }
 
-fn logProgressBytes(running: *bool, percent: *f32, bytes: *usize, total: usize, operation: []const u8) void {
+fn logProgressBytes(io: std.Io, running: *bool, percent: *f32, bytes: *usize, total: usize, operation: []const u8) void {
     while (running.*) {
-        std.time.sleep(std.time.ns_per_s * 10); // Wait 10s between messages
+        std.Io.sleep(io, .fromSeconds(10), .awake) catch {}; // Wait 10s between messages
         if (!running.*) break;
         const bytesMB = @as(f64, @floatFromInt(bytes.*)) / (1024.0 * 1024.0);
         const totalMB = @as(f64, @floatFromInt(total)) / (1024.0 * 1024.0);

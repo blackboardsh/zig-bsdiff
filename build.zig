@@ -5,20 +5,20 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    // Link pre-compiled libsais (compiled with clang during setup)
-    // Note: We don't use Zig's C backend to compile libsais because it has
-    // incompatibilities. Instead, setup.js compiles it with clang.
+    // Link pre-compiled libsais (compiled with `zig cc` during setup)
+    // Note: We don't use Zig's build system to compile libsais because it has
+    // incompatibilities. Instead, setup.js compiles it with `zig cc`.
 
-    const libzstd = b.addStaticLibrary(.{
-        .name = "zstd",
+    const zstd_module = b.createModule(.{
         .target = target,
         .optimize = optimize,
+        .link_libc = true,
     });
 
     // Disable assembly optimizations to avoid linking issues with missing HUF assembly functions
-    libzstd.defineCMacro("ZSTD_DISABLE_ASM", "1");
-    
-    libzstd.addCSourceFiles(.{
+    zstd_module.addCMacro("ZSTD_DISABLE_ASM", "1");
+
+    zstd_module.addCSourceFiles(.{
         .files = &[_][]const u8{
             "zstd/lib/common/debug.c",
             "zstd/lib/common/entropy_common.c",
@@ -52,34 +52,44 @@ pub fn build(b: *std.Build) void {
         },
     });
 
-    libzstd.linkLibC();
+    const libzstd = b.addLibrary(.{
+        .name = "zstd",
+        .linkage = .static,
+        .root_module = zstd_module,
+    });
 
-    const bsdiff = b.addExecutable(.{
-        .name = "bsdiff",
+    const bsdiff_module = b.createModule(.{
         .root_source_file = b.path("bsdiff.zig"),
         .target = target,
         .optimize = optimize,
     });
-
-    bsdiff.linkLibrary(libzstd);
-    bsdiff.addObjectFile(b.path("vendors/libsais/libsais.a"));
+    bsdiff_module.linkLibrary(libzstd);
+    bsdiff_module.addObjectFile(b.path("vendors/libsais/libsais.a"));
 
     // This is for the cImport to import the .h files
-    bsdiff.addIncludePath(b.path("zstd/lib"));
-    bsdiff.addIncludePath(b.path("vendors/libsais"));
-    bsdiff.addIncludePath(b.path("src/libsais-wrapper"));
+    bsdiff_module.addIncludePath(b.path("zstd/lib"));
+    bsdiff_module.addIncludePath(b.path("vendors/libsais"));
+    bsdiff_module.addIncludePath(b.path("src/libsais-wrapper"));
+
+    const bsdiff = b.addExecutable(.{
+        .name = "bsdiff",
+        .root_module = bsdiff_module,
+    });
 
     b.installArtifact(bsdiff);
 
-    const bspatch = b.addExecutable(.{
-        .name = "bspatch",
+    const bspatch_module = b.createModule(.{
         .root_source_file = b.path("bspatch.zig"),
         .target = target,
         .optimize = optimize,
     });
+    bspatch_module.linkLibrary(libzstd);
+    bspatch_module.addIncludePath(b.path("zstd/lib"));
 
-    bspatch.linkLibrary(libzstd);
-    bspatch.addIncludePath(b.path("zstd/lib"));
+    const bspatch = b.addExecutable(.{
+        .name = "bspatch",
+        .root_module = bspatch_module,
+    });
 
     b.installArtifact(bspatch);
 
@@ -88,17 +98,20 @@ pub fn build(b: *std.Build) void {
     const bspatch_only = b.step("bspatch-only", "Build only bspatch");
     bspatch_only.dependOn(&b.addInstallArtifact(bspatch, .{}).step);
 
-    const tests = b.addTest(.{
+    const tests_module = b.createModule(.{
         .root_source_file = b.path("tests.zig"),
         .target = target,
         .optimize = optimize,
     });
+    tests_module.addIncludePath(b.path("zstd/lib"));
+    tests_module.addIncludePath(b.path("vendors/libsais"));
+    tests_module.addIncludePath(b.path("src/libsais-wrapper"));
+    tests_module.linkLibrary(libzstd);
+    tests_module.addObjectFile(b.path("vendors/libsais/libsais.a"));
 
-    tests.addIncludePath(b.path("zstd/lib"));
-    tests.addIncludePath(b.path("vendors/libsais"));
-    tests.addIncludePath(b.path("src/libsais-wrapper"));
-    tests.linkLibrary(libzstd);
-    tests.addObjectFile(b.path("vendors/libsais/libsais.a"));
+    const tests = b.addTest(.{
+        .root_module = tests_module,
+    });
 
     const run_tests = b.addRunArtifact(tests);
     const test_step = b.step("test", "Run bsdiff/bspatch roundtrip tests");
