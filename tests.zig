@@ -77,7 +77,7 @@ fn runRoundTripPatch(useZstd: bool) !void {
     const updatedTar = try buildTarArchive(allocator, updatedSpecs[0..]);
 
     var allocator_handle = allocator;
-    const patch = try bsdiff.calculateDifferences(&allocator_handle, std.testing.io, originalTar, updatedTar, useZstd);
+    const patch = try bsdiff.calculateDifferences(&allocator_handle, std.testing.io, originalTar, updatedTar, useZstd, 0);
 
     allocator_handle = allocator;
     const patchedTar = try bspatch.applyPatch(&allocator_handle, originalTar, patch);
@@ -128,7 +128,7 @@ test "bsdiff/bspatch roundtrip with binary size changes" {
 
     for ([_][]const u8{ grown, shrunk }) |newFile| {
         var allocator_handle = allocator;
-        const patchData = try bsdiff.calculateDifferences(&allocator_handle, std.testing.io, oldFile, newFile, true);
+        const patchData = try bsdiff.calculateDifferences(&allocator_handle, std.testing.io, oldFile, newFile, true, 0);
 
         allocator_handle = allocator;
         const patchedFile = try bspatch.applyPatch(&allocator_handle, oldFile, patchData);
@@ -185,7 +185,7 @@ test "bsdiff/bspatch roundtrip with large files" {
     }
 
     var allocator_handle = allocator;
-    const patchData = try bsdiff.calculateDifferences(&allocator_handle, std.testing.io, oldFile, newFile, true);
+    const patchData = try bsdiff.calculateDifferences(&allocator_handle, std.testing.io, oldFile, newFile, true, 0);
 
     allocator_handle = allocator;
     const patchedFile = try bspatch.applyPatch(&allocator_handle, oldFile, patchData);
@@ -274,7 +274,44 @@ test "bsdiff/bspatch parallel chunk boundary handling" {
     }
 
     var allocator_handle = allocator;
-    const patchData = try bsdiff.calculateDifferences(&allocator_handle, std.testing.io, oldFile, newFile, true);
+    const patchData = try bsdiff.calculateDifferences(&allocator_handle, std.testing.io, oldFile, newFile, true, 0);
+
+    allocator_handle = allocator;
+    const patchedFile = try bspatch.applyPatch(&allocator_handle, oldFile, patchData);
+
+    try std.testing.expectEqual(newFile.len, patchedFile.len);
+    try std.testing.expectEqualSlices(u8, newFile, patchedFile);
+}
+
+// A tripped search-effort budget must still produce a valid patch: degenerate
+// windows fall back to literal extra data and matching resumes afterwards, and
+// bspatch must reconstruct the new file exactly. Uses multi-chunk sizes so the
+// literal windows also exercise the merge path.
+test "exhausted search budget degrades to a valid literal patch" {
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+
+    const allocator = arena.allocator();
+
+    const fileSize: usize = 4 * 1024 * 1024;
+    var oldFile = try allocator.alloc(u8, fileSize);
+    var newFile = try allocator.alloc(u8, fileSize);
+
+    var prng = std.Random.DefaultPrng.init(97531);
+    var random = prng.random();
+
+    for (0..fileSize) |i| {
+        oldFile[i] = @truncate((i * 11 + 5) % 256);
+    }
+    @memcpy(newFile, oldFile);
+    for (1 * 1024 * 1024..2 * 1024 * 1024) |i| {
+        newFile[i] = random.int(u8);
+    }
+
+    var allocator_handle = allocator;
+    // Effort 1 trips on the random region (which charges ~19 units per byte)
+    // while the patterned regions still match normally.
+    const patchData = try bsdiff.calculateDifferences(&allocator_handle, std.testing.io, oldFile, newFile, true, 1);
 
     allocator_handle = allocator;
     const patchedFile = try bspatch.applyPatch(&allocator_handle, oldFile, patchData);

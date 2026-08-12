@@ -100,12 +100,33 @@ pub fn main(init: std.process.Init) !void {
     // the original bsdiff implementation.
     // In electrobun we disable block compression and compress the whole patch file with zstd
     // in a separate process.
-    const optionUseZstd: []const u8 = if (args.len > 4) args[4] else "";
-    const useZstd = std.mem.eql(u8, optionUseZstd, "--use-zstd");
+    var useZstd = false;
+    // Pathological inputs can make the match search grind for hours advancing
+    // one byte at a time. The search effort factor deterministically bounds
+    // that: unproductive search work is charged against a per-window allowance
+    // of (window size x effort); a window that exhausts it is emitted as
+    // literal extra data and matching resumes at the next window. Deterministic
+    // by construction, so identical inputs produce identical patches on any
+    // machine.
+    var searchEffort: u64 = defaultSearchEffort;
+    const flagArgs = if (args.len > 4) args[4..] else args[0..0];
+    for (flagArgs) |arg| {
+        if (std.mem.eql(u8, arg, "--use-zstd")) {
+            useZstd = true;
+        } else if (std.mem.startsWith(u8, arg, "--search-effort=")) {
+            const value = arg["--search-effort=".len..];
+            searchEffort = std.fmt.parseInt(u64, value, 10) catch {
+                std.debug.print("Invalid --search-effort value: {s}\n", .{value});
+                std.process.exit(1);
+            };
+        }
+    }
 
     if (oldFilePath.len == 0 or newFilePath.len == 0 or patchFilePath.len == 0) {
         std.debug.print("Usage: bsdiff <oldFilePath> <newFilePath> <patchFilePath>\n", .{});
         std.debug.print("Usage: bsdiff <oldFilePath> <newFilePath> <patchFilePath> --use-zstd\n", .{});
+        std.debug.print("Options:\n", .{});
+        std.debug.print("  --search-effort=<n>  Unproductive-search allowance per window as a multiple of window size (default {d}, 0 = unlimited)\n", .{defaultSearchEffort});
         std.process.exit(1);
     }
 
@@ -132,7 +153,7 @@ pub fn main(init: std.process.Init) !void {
     std.debug.print("Generating Patch file to turn File A into File B...", .{});
     std.debug.print("\n", .{});
 
-    const patch = try calculateDifferences(&allocator, io, oldFileBuff, newFileBuff, useZstd);
+    const patch = try calculateDifferences(&allocator, io, oldFileBuff, newFileBuff, useZstd, searchEffort);
 
     // Write the patch file, internal blocks compressed with bzip2
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = patchFilePath, .data = patch });
@@ -143,7 +164,21 @@ fn nowMs(io: std.Io) i64 {
     return std.Io.Timestamp.now(io, .awake).toMilliseconds();
 }
 
-pub fn calculateDifferences(allocator: *std.mem.Allocator, io: std.Io, oldData: []const u8, newData: []const u8, useZstd: bool) ![]u8 {
+/// The search-effort window. Budget accounting resets at window granularity so
+/// a degenerate region only degrades its own windows, not the whole chunk.
+pub const searchEffortWindowSize: usize = 1024 * 1024;
+
+/// Default unproductive-search allowance per window, as a multiple of the
+/// window size. Healthy scans charge well under 32x: random regions charge a
+/// few dozen units per byte and matching regions advance by whole matches
+/// without charging. Only a degenerate scan — long matches repeatedly rejected
+/// by the extension score while advancing one byte at a time — exceeds it.
+pub const defaultSearchEffort: u64 = 32;
+
+/// searchEffort semantics: 0 disables the budget; otherwise each window of
+/// newData gets searchEffort x window-size charge units of unproductive search
+/// work before it is emitted as literal data. Deterministic for fixed inputs.
+pub fn calculateDifferences(allocator: *std.mem.Allocator, io: std.Io, oldData: []const u8, newData: []const u8, useZstd: bool, searchEffort: u64) ![]u8 {
     if (!useZstd) {
         std.debug.print("Block compression with bzip2 not yet implemented.\n", .{});
     }
@@ -215,6 +250,8 @@ pub fn calculateDifferences(allocator: *std.mem.Allocator, io: std.Io, oldData: 
             newData,
             chunkStart,
             nominalEnd,
+            i,
+            searchEffort,
             &completedChunks,
         });
     }
@@ -567,6 +604,8 @@ fn processChunk(
     newData: []const u8,
     chunkStart: usize,
     nominalEnd: usize,
+    chunkIndex: usize,
+    searchEffort: u64,
 ) !ChunkResult {
     const newsize = newData.len;
     const oldsize = oldData.len;
@@ -607,14 +646,56 @@ fn processChunk(
     // Track if we're in the middle of a match when we hit the boundary
     var actualEndPos: usize = chunkStart;
 
+    // Deterministic search budget: unproductive search work — long matches the
+    // extension score keeps rejecting while the scan advances one byte at a
+    // time — is charged against a per-window allowance. A window that exhausts
+    // it is emitted as literal extra data and matching resumes at the next
+    // window, so a degenerate region only degrades itself.
+    const windowBudget: u64 = searchEffort * @as(u64, searchEffortWindowSize);
+    var windowCharge: u64 = 0;
+    var windowBoundary: usize = chunkStart + searchEffortWindowSize;
+    var degradedBytes: usize = 0;
+
     // Main diff loop for this chunk
-    while (scanIndex < newsize) {
+    outer: while (scanIndex < newsize) {
         matchScore = 0;
         scanIndex += matchLength;
         scoreCounter = scanIndex;
 
         // Search for matches
         while (scanIndex < newsize) {
+            if (@as(usize, @intCast(scanIndex)) >= windowBoundary) {
+                windowCharge = 0;
+                windowBoundary = @as(usize, @intCast(scanIndex)) + searchEffortWindowSize;
+            }
+            if (searchEffort != 0 and windowCharge > windowBudget) {
+                // This window is degenerate; cover the rest of it with one
+                // literal entry (diffBy=0, extraBy=len, seekBy=0 keeps oldpos
+                // unchanged) and resume matching at the window boundary.
+                const coveredEnd: usize = @intCast(lastScanIndex);
+                const literalEnd = @min(@max(windowBoundary, coveredEnd), newsize);
+                if (literalEnd > coveredEnd) {
+                    const literalLen = literalEnd - coveredEnd;
+                    offtout(0, controlData[controlLen..][0..8]);
+                    controlLen += 8;
+                    offtout(@intCast(literalLen), controlData[controlLen..][0..8]);
+                    controlLen += 8;
+                    offtout(0, controlData[controlLen..][0..8]);
+                    controlLen += 8;
+                    @memcpy(extraData[extraLen..][0..literalLen], newData[coveredEnd..literalEnd]);
+                    extraLen += literalLen;
+                    degradedBytes += literalLen;
+                }
+                lastScanIndex = @intCast(literalEnd);
+                actualEndPos = literalEnd;
+                scanIndex = @intCast(literalEnd);
+                matchLength = 0;
+                windowCharge = 0;
+                windowBoundary = literalEnd + searchEffortWindowSize;
+                if (literalEnd >= nominalEnd) break :outer;
+                continue :outer;
+            }
+
             matchLength = @intCast(searchWithLCP(suffixIndexes, oldData, newData[@intCast(scanIndex)..], 0, @intCast(oldsize), &matchPosition));
 
             while (scoreCounter < scanIndex + matchLength) {
@@ -635,6 +716,9 @@ fn processChunk(
                 matchScore -= 1;
             }
 
+            // Advancing byte-by-byte after a rejected match is the unproductive
+            // path; charge the work the search just did against this window.
+            windowCharge += @as(u64, @intCast(matchLength)) + 16;
             scanIndex += 1;
         }
 
@@ -766,6 +850,11 @@ fn processChunk(
         }
     }
 
+    if (degradedBytes > 0) {
+        const degradedMB = @as(f64, @floatFromInt(degradedBytes)) / (1024.0 * 1024.0);
+        std.debug.print("Chunk {d}: search effort budget hit; {d:.1} MB emitted as literal data\n", .{ chunkIndex, degradedMB });
+    }
+
     return ChunkResult{
         .controlData = controlData,
         .controlLen = controlLen,
@@ -817,9 +906,11 @@ fn processChunkThread(
     newData: []const u8,
     chunkStart: usize,
     nominalEnd: usize,
+    chunkIndex: usize,
+    searchEffort: u64,
     completedChunks: *usize,
 ) void {
-    result.* = processChunk(allocator, suffixIndexes, oldData, newData, chunkStart, nominalEnd) catch |err| {
+    result.* = processChunk(allocator, suffixIndexes, oldData, newData, chunkStart, nominalEnd, chunkIndex, searchEffort) catch |err| {
         std.debug.print("Chunk processing error: {}\n", .{err});
         _ = @atomicRmw(usize, completedChunks, .Add, 1, .seq_cst);
         return;
