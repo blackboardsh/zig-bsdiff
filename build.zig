@@ -116,4 +116,6 @@ pub fn build(b: *std.Build) void {
     const run_tests = b.addRunArtifact(tests);
     const test_step = b.step("test", "Run bsdiff/bspatch roundtrip tests");
     test_step.dependOn(&run_tests.step);
+    const test_build_step = b.step("test-build", "Build tests for execution on the target machine");
+    test_build_step.dependOn(&b.addInstallArtifact(tests, .{}).step);
 }

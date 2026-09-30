@@ -1,6 +1,8 @@
 name: Build and Release
 
 on:
+  pull_request:
+    branches: [main]
   push:
     tags:
       - 'v*'
@@ -39,6 +41,13 @@ jobs:
             platform: win32
             arch: x64
             zig-target: x86_64-windows
+            bspatch-target: x86_64-windows-msvc
+          - os: windows-2025
+            platform: win32
+            arch: arm64
+            zig-target: aarch64-windows-msvc
+            bspatch-target: aarch64-windows-msvc
+            cross: true
 
     runs-on: ${{ matrix.os }}
 
@@ -62,6 +71,8 @@ jobs:
       - name: Setup MSVC on Windows
         if: matrix.platform == 'win32'
         uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: ${{ matrix.arch }}
 
       # libsais is now compiled by `zig cc` inside scripts/setup.js, so MinGW
       # is no longer needed on Windows. (Previously `choco install mingw` was
@@ -70,7 +81,7 @@ jobs:
 
       - name: Setup dependencies
         run: |
-          node scripts/setup.js
+          node scripts/setup.js --target=${{ matrix.zig-target }}
 
       - name: Build binaries
         run: |
@@ -79,11 +90,27 @@ jobs:
       - name: Rebuild bspatch with MSVC ABI (Windows)
         if: matrix.platform == 'win32'
         run: |
-          zig build bspatch-only -Doptimize=ReleaseFast -Dtarget=x86_64-windows-msvc
+          zig build bspatch-only -Doptimize=ReleaseFast -Dtarget=${{ matrix.bspatch-target }} -Dcpu=baseline
+
+      - name: Test build target selection
+        run: node --test scripts/build-target.test.js
 
       - name: Test
+        if: matrix.cross != true
         run: |
-          zig build test
+          zig build test -Dtarget=${{ matrix.zig-target }}
+
+      - name: Build ARM64 tests
+        if: matrix.cross == true
+        run: zig build test-build -Dtarget=${{ matrix.zig-target }}
+
+      - name: Upload ARM64 tests
+        if: matrix.cross == true
+        uses: actions/upload-artifact@v4
+        with:
+          name: arm64-tests-zig-bsdiff
+          path: zig-out/bin/test.exe
+          if-no-files-found: error
 
       - name: Package binaries
         run: |
@@ -105,8 +132,37 @@ jobs:
           name: zig-bsdiff-${{ matrix.platform }}-${{ matrix.arch }}
           path: zig-bsdiff-${{ matrix.platform }}-${{ matrix.arch }}.tar.gz
 
-  release:
+  test-windows-arm64:
     needs: build
+    runs-on: windows-11-arm
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - uses: actions/download-artifact@v4
+        with:
+          name: arm64-tests-zig-bsdiff
+          path: arm64-tests
+      - uses: actions/download-artifact@v4
+        with:
+          name: zig-bsdiff-win32-arm64
+          path: arm64-release
+      - name: Run ARM64 tests and packaged CLIs
+        shell: pwsh
+        run: |
+          & ./arm64-tests/test.exe
+          if ($LASTEXITCODE -ne 0) { throw 'ARM64 unit tests failed' }
+          tar -xzf arm64-release/zig-bsdiff-win32-arm64.tar.gz -C arm64-release
+          if ($LASTEXITCODE -ne 0) { throw 'ARM64 archive extraction failed' }
+          node scripts/test-release-binaries.js arm64-release arm64
+          if ($LASTEXITCODE -ne 0) { throw 'ARM64 release smoke test failed' }
+
+  release:
+    if: github.event_name != 'pull_request'
+    needs: [build, test-windows-arm64]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -123,6 +179,7 @@ jobs:
       - name: Download all artifacts
         uses: actions/download-artifact@v4
         with:
+          pattern: zig-bsdiff-*
           path: artifacts
 
       - name: Publish immutable release to R2
@@ -148,7 +205,7 @@ jobs:
             Pre-built binaries for:
             - **macOS** (arm64 & x64): `zig-bsdiff-darwin-[arch].tar.gz`
             - **Linux** (x64 & arm64): `zig-bsdiff-linux-[arch].tar.gz`
-            - **Windows** (x64): `zig-bsdiff-win32-x64.tar.gz`
+            - **Windows** (x64 & arm64): `zig-bsdiff-win32-[arch].tar.gz`
 
             ## Usage
 

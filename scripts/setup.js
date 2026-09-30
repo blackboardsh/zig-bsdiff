@@ -7,9 +7,10 @@
  * Based on electrobun and colab's vendoring approach
  */
 
-import { execSync } from 'child_process';
-import { existsSync, mkdirSync, rmSync, unlinkSync, renameSync, writeFileSync } from 'fs';
+import { execFileSync, execSync } from 'child_process';
+import { existsSync, mkdirSync, rmSync, unlinkSync, readFileSync, writeFileSync } from 'fs';
 import { join } from 'path';
+import { resolveBuildTarget } from './build-target.js';
 
 const ZIG_VERSION = '0.16.0';
 const LIBSAIS_VERSION = '2.8.6';
@@ -28,9 +29,12 @@ async function initSubmodules() {
 async function vendorLibsais() {
   const libsaisDir = join(process.cwd(), 'vendors', 'libsais');
   const libsaisLib = join(libsaisDir, 'libsais.a');
+  const targetStamp = join(libsaisDir, '.build-target');
+  const zigTarget = resolveBuildTarget();
+  const buildKey = `${zigTarget}:${ZIG_VERSION}:${LIBSAIS_VERSION}`;
 
   // Check if libsais is already compiled
-  if (existsSync(libsaisLib)) {
+  if (existsSync(libsaisLib) && existsSync(targetStamp) && readFileSync(targetStamp, 'utf8') === buildKey) {
     console.log('✓ libsais already vendored and compiled');
     return;
   }
@@ -65,54 +69,41 @@ async function vendorLibsais() {
     //   - the same baseline x86_64 ISA as `zig build -Dcpu=baseline` produces
     //     for the surrounding zig code, so the linked binary is uniformly
     //     baseline-safe.
-    // The .a is GNU-ABI; on Windows the surrounding `zig build` uses the
-    // matching `x86_64-windows` GNU target, so linking is clean.
+    // The archive uses the same target and ABI as the surrounding Zig build.
     console.log('Compiling libsais with zig cc...');
 
     const zigBinary = platform === 'win32' ? 'zig.exe' : 'zig';
     const zigPath = join(process.cwd(), 'vendors', 'zig', zigBinary);
     const wrapperDir = join(process.cwd(), 'src', 'libsais-wrapper');
 
-    // Map node's host platform/arch to a zig target triple. The CI matrix
-    // always runs the build on the same arch as the artifact it produces,
-    // so targeting the host is correct.
-    const arch = process.arch;
-    const zigArch = arch === 'arm64' ? 'aarch64' : 'x86_64';
-    let zigTarget;
-    if (platform === 'win32') {
-      zigTarget = `${zigArch}-windows-gnu`;
-    } else if (platform === 'darwin') {
-      zigTarget = `${zigArch}-macos`;
-    } else if (platform === 'linux') {
-      zigTarget = `${zigArch}-linux-gnu`;
-    } else {
-      throw new Error(`Unsupported platform for libsais build: ${platform}`);
-    }
-
-    const cflags = `-target ${zigTarget} -c -O3 -std=c99`;
+    // Compile for the artifact, which may differ from the compiler's host.
+    const cflags = ['-target', zigTarget, '-mcpu=baseline', '-c', '-O3', '-std=c99'];
+    // Invalidate the old stamp before rebuilding, including failed rebuilds.
+    if (existsSync(targetStamp)) unlinkSync(targetStamp);
 
     // Compile libsais source files
-    execSync(
-      `"${zigPath}" cc ${cflags} ${join(libsaisDir, 'libsais.c')} -o ${join(libsaisDir, 'libsais.o')}`,
+    execFileSync(zigPath,
+      ['cc', ...cflags, join(libsaisDir, 'libsais.c'), '-o', join(libsaisDir, 'libsais.o')],
       { stdio: 'inherit' }
     );
-    execSync(
-      `"${zigPath}" cc ${cflags} ${join(libsaisDir, 'libsais64.c')} -o ${join(libsaisDir, 'libsais64.o')}`,
+    execFileSync(zigPath,
+      ['cc', ...cflags, join(libsaisDir, 'libsais64.c'), '-o', join(libsaisDir, 'libsais64.o')],
       { stdio: 'inherit' }
     );
 
     // Compile wrapper with include path to libsais headers
-    execSync(
-      `"${zigPath}" cc ${cflags} -I ${libsaisDir} ${join(wrapperDir, 'zig_wrapper.c')} -o ${join(libsaisDir, 'zig_wrapper.o')}`,
+    execFileSync(zigPath,
+      ['cc', ...cflags, '-I', libsaisDir, join(wrapperDir, 'zig_wrapper.c'), '-o', join(libsaisDir, 'zig_wrapper.o')],
       { stdio: 'inherit' }
     );
 
     // Create static library using zig's bundled llvm-ar (works on every
     // platform without depending on a system `ar`).
-    execSync(
-      `"${zigPath}" ar rcs ${join(libsaisDir, 'libsais.a')} ${join(libsaisDir, 'libsais.o')} ${join(libsaisDir, 'libsais64.o')} ${join(libsaisDir, 'zig_wrapper.o')}`,
+    execFileSync(zigPath,
+      ['ar', 'rcs', libsaisLib, ...['libsais.o', 'libsais64.o', 'zig_wrapper.o'].map((name) => join(libsaisDir, name))],
       { stdio: 'inherit' }
     );
+    writeFileSync(targetStamp, buildKey);
 
     // Clean up object files
     const objFiles = ['libsais.o', 'libsais64.o', 'zig_wrapper.o'];
