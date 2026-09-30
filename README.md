@@ -25,7 +25,16 @@ Download pre-built binaries from the [GitHub Releases](https://github.com/blackb
 Available for:
 - macOS (arm64, x64)
 - Linux (arm64, x64)
-- Windows (x64)
+- Windows (x64, arm64)
+
+Windows ARM64 builds use an x64 Zig 0.16 compiler with an explicit target:
+run `node scripts/setup.js --target=aarch64-windows-msvc`, then
+`zig build -Dtarget=aarch64-windows-msvc -Doptimize=ReleaseFast -Dcpu=baseline`.
+Install the Visual Studio ARM64 C++ build tools and Windows SDK first.
+Setup rebuilds libsais when the requested target changes. Use
+`zig build test-build -Dtarget=aarch64-windows-msvc` to create a test executable
+for an ARM64 machine. Release publication waits for native ARM64 unit tests
+and a roundtrip using the packaged bsdiff/bspatch executables.
 
 Extract the tarball for your platform:
 
