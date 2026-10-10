@@ -42,13 +42,8 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
-const zstd = @cImport({
-    @cInclude("zstd.h");
-});
-
-const libsais = @cImport({
-    @cInclude("zig_wrapper.h");
-});
+const zstd = @import("zstd");
+const libsais = @import("libsais");
 
 const vectorSize = std.simd.suggestVectorLength(u8) orelse 4;
 
@@ -144,7 +139,7 @@ pub fn main(init: std.process.Init) !void {
     std.debug.print("System Info:\n", .{});
     std.debug.print("  CPUs: {d}\n", .{cpuCount});
     std.debug.print("  Platform: {s}\n", .{@tagName(builtin.target.cpu.arch)});
-    std.debug.print("  SIMD vector size: {d} bytes ({s})\n", .{vectorSize, if (vectorSize > 1) "enabled" else "disabled"});
+    std.debug.print("  SIMD vector size: {d} bytes ({s})\n", .{ vectorSize, if (vectorSize > 1) "enabled" else "disabled" });
     std.debug.print("\n", .{});
     std.debug.print("Input Files:\n", .{});
     std.debug.print("  File A (old): {d:.1} MB\n", .{oldSizeMB});
@@ -328,7 +323,6 @@ pub fn calculateDifferences(allocator: *std.mem.Allocator, io: std.Io, oldData: 
             // This handles cases where chunk N extends further than chunks N+1, N+2, etc.
             const prevActualEnd = maxActualEndSoFar;
             const thisStart = chunkResults[i].startPos;
-
 
             if (prevActualEnd <= thisStart) {
                 // No overlap - but there might be a gap
@@ -560,7 +554,7 @@ pub fn calculateDifferences(allocator: *std.mem.Allocator, io: std.Io, oldData: 
     // 24 8 length of new file    i64
 
     // Placeholder for the buffer used in offtout
-    var buffer = [_]u8{0} ** 8;
+    var buffer: [8]u8 = @splat(0);
 
     // Combine header, diffBlock, and extraBlock into a single byte slice to return
     const headerLength = 32;
@@ -1268,7 +1262,7 @@ fn qsufsortFast(allocator: *std.mem.Allocator, suffixIndexes: []i64, buf: []cons
     // perf: instead of creating a buckets array of 256 elements, and shifting them over one index back and forth in the alogirthm,
     // we can create a slightly longer array, and just reposition the slice which should be a bit faster
 
-    var _buckets: [257]i64 = [_]i64{0} ** 257;
+    var _buckets: [257]i64 = @splat(0);
     var buckets = _buckets[1..];
 
     // inverse of the suffix array, sorted array of suffixes. indexes are suffixes sorted longest to shortest, values the index of the first character group in the sorted array

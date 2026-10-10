@@ -12,7 +12,7 @@ import { existsSync, mkdirSync, rmSync, unlinkSync, readFileSync, writeFileSync 
 import { join } from 'path';
 import { resolveBuildTarget } from './build-target.js';
 
-const ZIG_VERSION = '0.16.0';
+const ZIG_VERSION = '0.17.0';
 const LIBSAIS_VERSION = '2.8.6';
 
 async function initSubmodules() {
@@ -126,10 +126,18 @@ async function vendorZig() {
   const zigBinary = platform === 'win32' ? 'zig.exe' : 'zig';
   const zigBinPath = join(process.cwd(), 'vendors', 'zig', zigBinary);
 
-  // Check if Zig is already vendored
+  // Existing checkouts must upgrade their vendored compiler too.
   if (existsSync(zigBinPath)) {
-    console.log('✓ Zig already vendored');
-    return;
+    try {
+      const installedVersion = execFileSync(zigBinPath, ['version'], { encoding: 'utf8' }).trim();
+      if (installedVersion === ZIG_VERSION) {
+        console.log(`✓ Zig ${ZIG_VERSION} already vendored`);
+        return;
+      }
+      console.log(`Replacing Zig ${installedVersion} with ${ZIG_VERSION}...`);
+    } catch {
+      console.log('Replacing unusable vendored Zig compiler...');
+    }
   }
 
   console.log('Vendoring Zig compiler...');
@@ -138,6 +146,7 @@ async function vendorZig() {
 
   try {
     const vendorsDir = join(process.cwd(), 'vendors', 'zig');
+    rmSync(vendorsDir, { recursive: true, force: true });
     mkdirSync(vendorsDir, { recursive: true });
 
     if (platform === 'darwin') {
@@ -189,6 +198,10 @@ async function vendorZig() {
     } else {
       console.error(`Unsupported platform: ${platform}`);
       process.exit(1);
+    }
+    const installedVersion = execFileSync(zigBinPath, ['version'], { encoding: 'utf8' }).trim();
+    if (installedVersion !== ZIG_VERSION) {
+      throw new Error(`Expected Zig ${ZIG_VERSION}, got ${installedVersion}`);
     }
   } catch (error) {
     console.error('Failed to vendor Zig:', error.message);

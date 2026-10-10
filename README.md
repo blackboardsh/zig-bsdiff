@@ -27,7 +27,7 @@ Available for:
 - Linux (arm64, x64)
 - Windows (x64, arm64)
 
-Windows ARM64 builds use an x64 Zig 0.16 compiler with an explicit target:
+Windows ARM64 builds use Zig 0.17.0 with an explicit target:
 run `node scripts/setup.js --target=aarch64-windows-msvc`, then
 `zig build -Dtarget=aarch64-windows-msvc -Doptimize=ReleaseFast -Dcpu=baseline`.
 Install the Visual Studio ARM64 C++ build tools and Windows SDK first.
@@ -68,6 +68,7 @@ Automatically detects the patch format (zstd or bzip2).
 
 - Bun (or Node.js)
 - Git
+- Zig 0.17.0 (downloaded automatically by setup)
 
 ### Build Steps
 

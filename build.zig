@@ -5,6 +5,21 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
+    const zstd_translation = b.addTranslateC(.{
+        .root_source_file = b.path("zstd/lib/zstd.h"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const zstd_bindings = zstd_translation.createModule();
+
+    const libsais_translation = b.addTranslateC(.{
+        .root_source_file = b.path("src/libsais-wrapper/zig_wrapper.h"),
+        .target = target,
+        .optimize = optimize,
+    });
+    libsais_translation.addIncludePath(b.path("vendors/libsais"));
+    const libsais_bindings = libsais_translation.createModule();
+
     // Link pre-compiled libsais (compiled with `zig cc` during setup)
     // Note: We don't use Zig's build system to compile libsais because it has
     // incompatibilities. Instead, setup.js compiles it with `zig cc`.
@@ -65,11 +80,8 @@ pub fn build(b: *std.Build) void {
     });
     bsdiff_module.linkLibrary(libzstd);
     bsdiff_module.addObjectFile(b.path("vendors/libsais/libsais.a"));
-
-    // This is for the cImport to import the .h files
-    bsdiff_module.addIncludePath(b.path("zstd/lib"));
-    bsdiff_module.addIncludePath(b.path("vendors/libsais"));
-    bsdiff_module.addIncludePath(b.path("src/libsais-wrapper"));
+    bsdiff_module.addImport("zstd", zstd_bindings);
+    bsdiff_module.addImport("libsais", libsais_bindings);
 
     const bsdiff = b.addExecutable(.{
         .name = "bsdiff",
@@ -84,7 +96,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     bspatch_module.linkLibrary(libzstd);
-    bspatch_module.addIncludePath(b.path("zstd/lib"));
+    bspatch_module.addImport("zstd", zstd_bindings);
 
     const bspatch = b.addExecutable(.{
         .name = "bspatch",
@@ -103,9 +115,8 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-    tests_module.addIncludePath(b.path("zstd/lib"));
-    tests_module.addIncludePath(b.path("vendors/libsais"));
-    tests_module.addIncludePath(b.path("src/libsais-wrapper"));
+    tests_module.addImport("zstd", zstd_bindings);
+    tests_module.addImport("libsais", libsais_bindings);
     tests_module.linkLibrary(libzstd);
     tests_module.addObjectFile(b.path("vendors/libsais/libsais.a"));
 

@@ -32,9 +32,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
-const zstd = @cImport({
-    @cInclude("zstd.h");
-});
+const zstd = @import("zstd");
 
 const vectorSize = std.simd.suggestVectorLength(u8) orelse 4;
 
