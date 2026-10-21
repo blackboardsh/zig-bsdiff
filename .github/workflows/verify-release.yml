@@ -1,0 +1,36 @@
+name: Verify Published macOS Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Immutable release version (defaults to package.json)'
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: Verify macOS ${{ matrix.arch }} release
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-15-intel
+            arch: x64
+          - os: macos-14
+            arch: arm64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          architecture: ${{ matrix.arch }}
+      - name: Verify exact immutable release and native CLI roundtrip
+        env:
+          RELEASE_VERSION: ${{ inputs.version }}
+          RELEASE_ARCH: ${{ matrix.arch }}
+        run: node scripts/verify-macos-release.js "$RELEASE_VERSION" "$RELEASE_ARCH"
